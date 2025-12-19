@@ -1,0 +1,11 @@
+einops
+torch
+transformers
+jaxtyping
+pandas
+datasets
+wandb
+accelerate
+bidict
+nnsight
+kornia
