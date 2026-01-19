@@ -2,3 +2,7 @@ sweep_results_*.pkl
 comp_diagrams/
 app_diagrams/
 logs/
+__pycache__/
+*/__pycache__/
+*.png
+*.pyc
