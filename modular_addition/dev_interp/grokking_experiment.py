@@ -47,15 +47,15 @@ from modular_addition.core import (
 class ExperimentConfig:
     """Configuration for the grokking trajectory experiment."""
     P: int = 113
-    d_hidden: int = 32
+    d_hidden: int = 64
     lr: float = 1e-3
     weight_decay: float = 1e-2
     batch_size: int = 512
-    total_steps: int = 20_000
-    checkpoint_every: int = 100
+    total_steps: int = 100_000
+    checkpoint_every: int = 500
     val_fraction: float = 0.4
     n_evecs: int = 4
-    seed: int = 42
+    seed: int = 1337
     output_dir: str = "modular_addition/dev_interp/results"
 
 

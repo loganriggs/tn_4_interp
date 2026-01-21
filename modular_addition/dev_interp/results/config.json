@@ -1,0 +1,13 @@
+{
+  "P": 113,
+  "d_hidden": 64,
+  "lr": 0.001,
+  "weight_decay": 0.01,
+  "batch_size": 512,
+  "total_steps": 100000,
+  "checkpoint_every": 500,
+  "val_fraction": 0.4,
+  "n_evecs": 4,
+  "seed": 1337,
+  "output_dir": "modular_addition/dev_interp/results"
+}
