@@ -52,16 +52,77 @@ class ExperimentConfig:
     weight_decay: float = 1e-2
     batch_size: int = 512
     total_steps: int = 100_000
-    checkpoint_every: int = 500
+    checkpoint_every: int = 500  # Used as fallback for late training
     val_fraction: float = 0.4
     n_evecs: int = 4
     seed: int = 1337
     output_dir: str = "modular_addition/dev_interp/results"
 
 
+def compute_checkpoint_schedule(
+    total_steps: int,
+    steps_per_epoch: int,
+    dense_epochs: int = 5,
+    log_checkpoints: int = 150
+) -> set[int]:
+    """
+    Generate checkpoint schedule with dense early sampling and log-spaced later epochs.
+
+    Schedule:
+    - Epochs 1 to dense_epochs: dense per-step sampling
+      (Epoch 1: every step, Epoch 2: every 2 steps, etc.)
+    - After dense_epochs: logarithmically spaced epoch checkpoints
+
+    Args:
+        total_steps: Total training steps
+        steps_per_epoch: Number of steps per epoch
+        dense_epochs: Number of epochs with dense per-step sampling
+        log_checkpoints: Approximate number of checkpoints in log phase
+
+    Returns:
+        Set of step numbers to checkpoint at
+    """
+    checkpoint_steps = {0}  # Always include random init
+    total_epochs = total_steps // steps_per_epoch
+
+    # Phase 1: Dense per-step sampling for first few epochs
+    for epoch in range(1, min(dense_epochs + 1, total_epochs + 1)):
+        epoch_start = (epoch - 1) * steps_per_epoch
+        epoch_end = min(epoch * steps_per_epoch, total_steps)
+        interval = epoch  # Epoch 1: every step, Epoch 2: every 2, etc.
+
+        for s in range(epoch_start, epoch_end, interval):
+            if s > 0:
+                checkpoint_steps.add(s)
+        checkpoint_steps.add(epoch_end)
+
+    # Phase 2: Logarithmically spaced epochs after dense phase
+    if total_epochs > dense_epochs:
+        log_epochs = np.unique(np.logspace(
+            np.log10(dense_epochs + 1),
+            np.log10(total_epochs),
+            num=log_checkpoints
+        ).astype(int))
+
+        for epoch in log_epochs:
+            step = epoch * steps_per_epoch
+            if step <= total_steps:
+                checkpoint_steps.add(step)
+
+    # Always include final step
+    checkpoint_steps.add(total_steps)
+
+    return checkpoint_steps
+
+
 def train_with_checkpoints(config: ExperimentConfig) -> tuple[dict, dict]:
     """
-    Train model and save checkpoints at step granularity.
+    Train model and save checkpoints with dense early sampling.
+
+    Uses a schedule that captures more checkpoints early in training:
+    - Epoch 1: every step (including random init at step 0)
+    - Epoch 2: every 2 steps
+    - Epoch N: every N steps (capped at 1 per epoch)
 
     Args:
         config: Experiment configuration
@@ -105,13 +166,42 @@ def train_with_checkpoints(config: ExperimentConfig) -> tuple[dict, dict]:
         drop_last=True
     )
 
+    # Compute steps per epoch and checkpoint schedule
+    steps_per_epoch = len(train_data) // config.batch_size
+    checkpoint_schedule = compute_checkpoint_schedule(config.total_steps, steps_per_epoch)
+    print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Total checkpoints scheduled: {len(checkpoint_schedule)}")
+
     # Storage
     checkpoints = {}
     history = {}
 
+    def save_checkpoint(step: int):
+        """Save checkpoint and compute metrics at given step."""
+        checkpoints[step] = {
+            k: v.cpu().clone() for k, v in model.state_dict().items()
+        }
+        model.eval()
+        with torch.no_grad():
+            train_logits = model(train_data)
+            train_loss = loss_fn(train_logits, train_labels).item()
+            val_logits = model(val_data)
+            val_loss = loss_fn(val_logits, val_labels).item()
+            val_acc = compute_accuracy(model, val_data, val_labels)
+        history[step] = {
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'val_acc': val_acc
+        }
+        return train_loss, val_loss, val_acc
+
+    # Save random init (step 0)
+    if 0 in checkpoint_schedule:
+        train_loss, val_loss, val_acc = save_checkpoint(0)
+        print(f"Step 0 (random init): train_loss={train_loss:.4f}, val_acc={val_acc:.4f}")
+
     # Training loop with step tracking
     global_step = 0
-    n_checkpoints = config.total_steps // config.checkpoint_every
     pbar = tqdm(total=config.total_steps, desc="Training")
 
     while global_step < config.total_steps:
@@ -130,34 +220,12 @@ def train_with_checkpoints(config: ExperimentConfig) -> tuple[dict, dict]:
             global_step += 1
             pbar.update(1)
 
-            # Checkpoint at specified intervals
-            if global_step % config.checkpoint_every == 0:
-                # Store checkpoint (move to CPU to save memory)
-                checkpoints[global_step] = {
-                    k: v.cpu().clone() for k, v in model.state_dict().items()
-                }
-
-                # Compute metrics
-                model.eval()
-                with torch.no_grad():
-                    # Training loss (on full train set for consistency)
-                    train_logits = model(train_data)
-                    train_loss = loss_fn(train_logits, train_labels).item()
-
-                    # Validation metrics
-                    val_logits = model(val_data)
-                    val_loss = loss_fn(val_logits, val_labels).item()
-                    val_acc = compute_accuracy(model, val_data, val_labels)
-
-                history[global_step] = {
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'val_acc': val_acc
-                }
-
+            # Checkpoint if in schedule
+            if global_step in checkpoint_schedule:
+                train_loss, val_loss, val_acc = save_checkpoint(global_step)
                 pbar.set_postfix({
+                    'ckpts': len(checkpoints),
                     'train_loss': f'{train_loss:.4f}',
-                    'val_loss': f'{val_loss:.4f}',
                     'val_acc': f'{val_acc:.4f}'
                 })
 
@@ -335,12 +403,19 @@ def main():
     """Run the grokking trajectory experiment."""
     config = ExperimentConfig()
 
+    # Compute expected schedule for display
+    train_samples = int(config.P * config.P * (1 - config.val_fraction))
+    steps_per_epoch = train_samples // config.batch_size
+    schedule = compute_checkpoint_schedule(config.total_steps, steps_per_epoch)
+
     print("=" * 60)
     print("Grokking Trajectory Experiment")
     print("=" * 60)
     print(f"P={config.P}, d_hidden={config.d_hidden}")
-    print(f"Total steps={config.total_steps}, checkpoints every {config.checkpoint_every} steps")
-    print(f"Expected checkpoints: {config.total_steps // config.checkpoint_every}")
+    print(f"Total steps={config.total_steps}")
+    print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Expected checkpoints: {len(schedule)} (dense early, sparse late)")
+    print(f"First 20 checkpoint steps: {sorted(schedule)[:20]}")
     print("=" * 60)
 
     # Phase 1: Train and checkpoint
