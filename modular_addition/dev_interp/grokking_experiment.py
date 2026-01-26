@@ -49,7 +49,7 @@ class ExperimentConfig:
     P: int = 113
     d_hidden: int = 64
     lr: float = 1e-3
-    weight_decay: float = 1e-2
+    weight_decay: float = 6e-2
     batch_size: int = 512
     total_steps: int = 100_000
     checkpoint_every: int = 500  # Used as fallback for late training
@@ -129,7 +129,7 @@ def train_with_checkpoints(config: ExperimentConfig) -> tuple[dict, dict]:
 
     Returns:
         checkpoints: {step: state_dict}
-        history: {step: {'train_loss', 'val_loss', 'val_acc'}}
+        history: {step: {'train_loss', 'train_acc', 'val_loss', 'val_acc'}}
     """
     device = get_device()
     print(f"Using device: {device}")
@@ -185,20 +185,22 @@ def train_with_checkpoints(config: ExperimentConfig) -> tuple[dict, dict]:
         with torch.no_grad():
             train_logits = model(train_data)
             train_loss = loss_fn(train_logits, train_labels).item()
+            train_acc = compute_accuracy(model, train_data, train_labels)
             val_logits = model(val_data)
             val_loss = loss_fn(val_logits, val_labels).item()
             val_acc = compute_accuracy(model, val_data, val_labels)
         history[step] = {
             'train_loss': train_loss,
+            'train_acc': train_acc,
             'val_loss': val_loss,
             'val_acc': val_acc
         }
-        return train_loss, val_loss, val_acc
+        return train_loss, train_acc, val_loss, val_acc
 
     # Save random init (step 0)
     if 0 in checkpoint_schedule:
-        train_loss, val_loss, val_acc = save_checkpoint(0)
-        print(f"Step 0 (random init): train_loss={train_loss:.4f}, val_acc={val_acc:.4f}")
+        train_loss, train_acc, val_loss, val_acc = save_checkpoint(0)
+        print(f"Step 0 (random init): train_loss={train_loss:.4f}, train_acc={train_acc:.4f}, val_acc={val_acc:.4f}")
 
     # Training loop with step tracking
     global_step = 0
@@ -222,10 +224,11 @@ def train_with_checkpoints(config: ExperimentConfig) -> tuple[dict, dict]:
 
             # Checkpoint if in schedule
             if global_step in checkpoint_schedule:
-                train_loss, val_loss, val_acc = save_checkpoint(global_step)
+                train_loss, train_acc, val_loss, val_acc = save_checkpoint(global_step)
                 pbar.set_postfix({
                     'ckpts': len(checkpoints),
                     'train_loss': f'{train_loss:.4f}',
+                    'train_acc': f'{train_acc:.4f}',
                     'val_acc': f'{val_acc:.4f}'
                 })
 

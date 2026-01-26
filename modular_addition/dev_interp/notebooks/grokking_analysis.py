@@ -21,8 +21,9 @@ plt.rcParams['font.size'] = 12
 # ## 1. Load Results
 
 # %%
-# Path to results
-results_dir = Path("../results")
+# Path to results - change this to switch between experiments
+# "../results" = WD=1e-2 (original), "../results_wd6e2" = WD=6e-2
+results_dir = Path("../results_wd6e2")  # WD=6e-2 experiment
 
 # Load config
 with open(results_dir / "config.json") as f:
@@ -483,8 +484,15 @@ selected_steps.append(504)
 between_504_3416 = np.linspace(504, 3416, 6)[1:-1]  # 4 points excluding endpoints
 selected_steps.extend(find_closest_checkpoints(between_504_3416, all_steps))
 
-# Add 3416, 22904
-selected_steps.extend([3416, 22904])
+# Add 3416
+selected_steps.append(3416)
+
+# Add 3 evenly spaced between 3416 and 22904
+between_3416_22904 = np.linspace(3416, 22904, 5)[1:-1]  # 3 points excluding endpoints
+selected_steps.extend(find_closest_checkpoints(between_3416_22904, all_steps))
+
+# Add 22904
+selected_steps.append(22904)
 
 # Add 10 evenly spaced between 22904 and last step (replacing the 2nd-to-last)
 last_step = all_steps[-1]
@@ -703,6 +711,15 @@ for step in selected_steps:
     freq_heatmaps[step] = heatmap
     print(f"Computed frequency heatmap for step {step}")
 
+# Save frequency heatmaps and marginals for later use
+freq_heatmaps_array = np.array([freq_heatmaps[s] for s in selected_steps])
+freq_marginals_array = np.array([freq_heatmaps[s].sum(axis=0) for s in selected_steps])
+np.savez(results_dir / "freq_heatmaps.npz",
+         heatmaps=freq_heatmaps_array,
+         marginals=freq_marginals_array,
+         selected_steps=np.array(selected_steps))
+print(f"Saved frequency heatmaps and marginals to {results_dir / 'freq_heatmaps.npz'}")
+
 # %%
 # Plot frequency heatmaps for all selected checkpoints
 n_checkpoints = len(selected_steps)
@@ -794,5 +811,178 @@ plt.suptitle('Frequency Structure Evolution Through Training', fontsize=16, y=1.
 plt.tight_layout()
 plt.savefig(results_dir / "frequency_evolution_combined.png", dpi=150)
 plt.show()
+
+# %% [markdown]
+# ## 11. Group Checkpoints by TN Similarity Blocks
+#
+# Cluster checkpoints that are highly similar (>= threshold) into groups,
+# then plot one representative frequency marginal per group.
+
+# %%
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
+# Convert similarity to distance
+tn_distance = 1 - selected_tn_sim
+
+# Hierarchical clustering
+# Use a high similarity threshold (e.g., 0.95) to group very similar checkpoints
+similarity_threshold = 0.7
+distance_threshold = 1 - similarity_threshold
+
+# Make sure diagonal is exactly 0 for distance matrix
+np.fill_diagonal(tn_distance, 0)
+
+# Convert to condensed form for linkage
+condensed_dist = squareform(tn_distance)
+
+# Perform hierarchical clustering
+Z = linkage(condensed_dist, method='complete')
+
+# Cut tree at distance threshold to get clusters
+cluster_labels = fcluster(Z, t=distance_threshold, criterion='distance')
+
+# Group checkpoints by cluster
+groups = {}
+for idx, (step, label) in enumerate(zip(selected_steps, cluster_labels)):
+    if label not in groups:
+        groups[label] = []
+    groups[label].append((idx, step))
+
+# Sort groups by the first step in each group
+sorted_groups = sorted(groups.items(), key=lambda x: x[1][0][1])
+
+print(f"Found {len(sorted_groups)} groups with similarity threshold {similarity_threshold}:")
+for group_id, (label, members) in enumerate(sorted_groups):
+    steps_in_group = [step for _, step in members]
+    print(f"  Group {group_id + 1}: {steps_in_group}")
+
+# %%
+# Compute global y-axis max for consistent scaling
+all_marginals = []
+for step in selected_steps:
+    marginal = freq_heatmaps[step].sum(axis=0)
+    all_marginals.append(marginal)
+global_y_max = max(m.max() for m in all_marginals) * 1.1
+
+print(f"Global y-axis max: {global_y_max:.2f}")
+
+# %%
+# Plot one representative per group (first checkpoint in each group)
+n_groups = len(sorted_groups)
+fig, axes = plt.subplots(1, n_groups, figsize=(4 * n_groups, 4))
+if n_groups == 1:
+    axes = [axes]
+
+for group_idx, (label, members) in enumerate(sorted_groups):
+    ax = axes[group_idx]
+
+    # Use first checkpoint as representative
+    rep_idx, rep_step = members[0]
+    freq_marginal = freq_heatmaps[rep_step].sum(axis=0)
+
+    ax.bar(range(n_freqs), freq_marginal, color='steelblue', alpha=0.7)
+    ax.set_xlabel('Frequency k', fontsize=10)
+    ax.set_ylabel('Total weight', fontsize=10)
+    ax.set_xlim(-0.5, n_freqs - 0.5)
+    ax.set_ylim(0, global_y_max)  # Same y-axis scale
+
+    # Title with group info
+    all_steps = [step for _, step in members]
+    if len(all_steps) <= 3:
+        title = f"Steps: {all_steps}"
+    else:
+        title = f"Steps: {all_steps[0]}...{all_steps[-1]} ({len(all_steps)})"
+    ax.set_title(title, fontsize=10)
+
+    # Mark top 3 frequencies
+    top_freqs = np.argsort(freq_marginal)[-3:][::-1]
+    for f in top_freqs:
+        if freq_marginal[f] > global_y_max * 0.05:
+            ax.annotate(f'{f}', xy=(f, freq_marginal[f]),
+                       xytext=(f, freq_marginal[f] + global_y_max * 0.03),
+                       ha='center', fontsize=9, color='red')
+
+plt.suptitle(f'Frequency Usage by TN Similarity Groups (threshold={similarity_threshold})', fontsize=14)
+plt.tight_layout()
+plt.savefig(results_dir / "frequency_by_groups_representative.png", dpi=150)
+plt.show()
+
+# %%
+# Plot ALL checkpoints within each group (stacked vertically by group)
+fig, axes = plt.subplots(n_groups, 1, figsize=(14, 3 * n_groups))
+if n_groups == 1:
+    axes = [axes]
+
+colors = plt.cm.viridis(np.linspace(0, 1, max(len(m) for _, m in sorted_groups)))
+
+for group_idx, (label, members) in enumerate(sorted_groups):
+    ax = axes[group_idx]
+
+    # Plot all checkpoints in this group with slight offset for visibility
+    width = 0.8 / len(members)
+    for i, (idx, step) in enumerate(members):
+        freq_marginal = freq_heatmaps[step].sum(axis=0)
+        offset = (i - len(members) / 2 + 0.5) * width
+        ax.bar(np.arange(n_freqs) + offset, freq_marginal, width=width,
+               alpha=0.7, label=f'{step}', color=colors[i])
+
+    ax.set_xlabel('Frequency k', fontsize=10)
+    ax.set_ylabel('Total weight', fontsize=10)
+    ax.set_xlim(-0.5, n_freqs - 0.5)
+    ax.set_ylim(0, global_y_max)  # Same y-axis scale
+
+    all_steps = [step for _, step in members]
+    ax.set_title(f'Group {group_idx + 1}: Steps {all_steps[0]} - {all_steps[-1]}', fontsize=12)
+    ax.legend(loc='upper right', fontsize=8, ncol=min(5, len(members)))
+
+plt.suptitle(f'Frequency Usage: All Checkpoints by Group (threshold={similarity_threshold})', fontsize=14)
+plt.tight_layout()
+plt.savefig(results_dir / "frequency_by_groups_all.png", dpi=150)
+plt.show()
+
+# %%
+# Summary: show group boundaries on TN similarity matrix
+fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.85))
+
+im = ax.imshow(selected_tn_sim, cmap='viridis', vmin=0, vmax=1)
+cbar = plt.colorbar(im, ax=ax)
+cbar.set_label('TN Similarity', fontsize=12)
+
+# Draw group boundaries
+cumsum = 0
+for label, members in sorted_groups:
+    group_size = len(members)
+    if cumsum > 0:
+        ax.axhline(y=cumsum - 0.5, color='red', linestyle='-', linewidth=2)
+        ax.axvline(x=cumsum - 0.5, color='red', linestyle='-', linewidth=2)
+    cumsum += group_size
+
+# Labels
+step_labels = [str(s) for s in selected_steps]
+ax.set_xticks(range(n))
+ax.set_xticklabels(step_labels, rotation=45, ha='right', fontsize=8)
+ax.set_yticks(range(n))
+ax.set_yticklabels(step_labels, fontsize=8)
+
+ax.set_xlabel('Step', fontsize=12)
+ax.set_ylabel('Step', fontsize=12)
+ax.set_title(f'TN Similarity with Group Boundaries (threshold={similarity_threshold})', fontsize=14)
+
+plt.tight_layout()
+plt.savefig(results_dir / "tn_sim_with_groups.png", dpi=150)
+plt.show()
+
+print(f"\nGroup summary:")
+for group_idx, (label, members) in enumerate(sorted_groups):
+    steps_list = [step for _, step in members]
+    print(f"  Group {group_idx + 1} ({len(members)} checkpoints): {steps_list}")
+
+# %% [markdown]
+# ## 12. Pairwise Frequency Heatmap Addition/Subtraction Grid
+#
+# See `frequency_grid_analysis.py` for pairwise addition/subtraction grids.
+# This was moved to a separate file to speed up iteration.
+# Run that file after this one to generate the grid plots.
 
 # %%
