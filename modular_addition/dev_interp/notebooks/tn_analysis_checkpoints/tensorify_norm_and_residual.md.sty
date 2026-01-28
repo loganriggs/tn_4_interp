@@ -1,0 +1,250 @@
+# Tensorifying RMSNorm and Residuals
+
+## 1. The Problem
+
+We want to express a normalized bilinear layer with residual as a **single tensor network**, so we can compute TN-similarity between models that include these components.
+
+**The architecture:**
+```
+x → RMSNorm → Bilinear → (+) → output
+         ↘____________↗
+           (residual)
+```
+
+**Two type errors to fix:**
+1. Bilinear layer is 3rd-order, residual (identity) is 2nd-order
+2. Normalization applies to bilinear input but not to residual
+
+---
+
+## 2. Pulling Out Normalization
+
+For a bilinear layer $f(x, x) = D \cdot [(Lx) \odot (Rx)]$, normalization can be factored out:
+
+$$f\left(\frac{x}{\|x\|}, \frac{x}{\|x\|}\right) = \frac{f(x, x)}{\|x\|^2}$$
+
+**Key insight:** Normalization only affects *scale*, not *direction*. 
+
+For analysis (not training), we can ignore normalization entirely and work with unnormalized tensors, since:
+- TN-similarity is scale-invariant (it's cosine similarity)
+- The output direction is unchanged
+
+---
+
+## 3. Fixing the Residual Type Error
+
+### 3.1 The Constant Wire Trick
+
+To add tensors of different orders, prepend a **constant dimension** to each wire:
+
+$$\mathbf{0} = [1, 0, 0, \ldots] \in \mathbb{R}^{d+1}$$
+
+Contracting $\mathbf{0}$ with any wire yields 1 (a "discard" operation).
+
+**Extended input space:** $\tilde{x} = [1, x_1, x_2, \ldots, x_d]^\top \in \mathbb{R}^{d+1}$
+
+### 3.2 Residual as a Tensor
+
+The identity/residual $x \mapsto x$ becomes a 3rd-order tensor by:
+
+$$\tilde{I}_{ijk} = \begin{cases} 
+\delta_{jk} & \text{if } i = 0 \text{ (constant dimension)} \\
+0 & \text{otherwise}
+\end{cases}$$
+
+This "uses" the constant dimension to match the bilinear layer's topology.
+
+### 3.3 Combining via Hidden Dimension Concatenation
+
+With both tensors now 3rd-order, we concatenate along the hidden dimension:
+
+$$T_{\text{combined}} = T_{\text{bilinear}} \oplus T_{\text{residual}}$$
+
+Explicitly, if:
+- Bilinear: $T^{(B)}_{ijk} = \sum_h D_{ih} L_{jh} R_{kh}$
+- Residual: $T^{(R)}_{ijk}$ as defined above
+
+Then the combined tensor has hidden dimension $d_{\text{hidden}} + 1$:
+
+$$T^{(\text{combined})}_{ijk} = \sum_{h=1}^{d_{\text{hidden}}} D_{ih} L_{jh} R_{kh} + T^{(R)}_{ijk}$$
+
+---
+
+## 4. Residual with Pre-Norm (The Hard Case)
+
+Modern architectures apply normalization *before* the bilinear layer but not to the residual:
+
+$$\text{output} = f\left(\frac{x}{\|x\|}, \frac{x}{\|x\|}\right) + x$$
+
+### 4.1 Bringing to Common Scale
+
+Multiply through by $\|x\|^2$:
+
+$$f\left(\frac{x}{\|x\|}, \frac{x}{\|x\|}\right) + x = \frac{f(x,x) + x\|x\|^2}{\|x\|^2}$$
+
+The residual term $x\|x\|^2$ is now a **3rd-order polynomial** in $x$.
+
+### 4.2 Residual Multiplication Tensor
+
+The operation $x \mapsto x\|x\|^2 = x \cdot (x^\top x)$ is represented by:
+
+$$T^{(\text{res-norm})}_{ijk} = \delta_{ij} \cdot \mathbf{1}_k + \delta_{ik} \cdot \mathbf{1}_j$$
+
+where indices $(i, j, k)$ correspond to (output, input-left, input-right).
+
+More explicitly, with the bilinear-style decomposition:
+- $L^{(\text{res})} = I$ (identity matrix)
+- $R^{(\text{res})} = I$ (identity matrix)  
+- $D^{(\text{res})} = I$ (identity matrix)
+
+But with the **symmetric** contraction: $h = (Lx) \odot (Rx) + (Rx) \odot (Lx) = 2(x \odot x) = 2x^2$ component-wise... 
+
+Actually, let's be more careful:
+
+$$[x\|x\|^2]_i = x_i \sum_j x_j^2$$
+
+This is:
+$$T^{(\text{res-norm})}_{ijk} = \delta_{jk}$$
+
+(Output index $i$ gets $x_i$, and we contract $j=k$ to get $\sum_j x_j^2$.)
+
+### 4.3 Combined Tensor (Pre-Norm + Residual)
+
+The full pre-norm residual block:
+
+$$T^{(\text{block})} = T^{(\text{bilinear})} \oplus T^{(\text{res-norm})}$$
+
+With factorization:
+$$L_{\text{block}} = \begin{bmatrix} L_{\text{bilinear}} \\ I \end{bmatrix}, \quad
+R_{\text{block}} = \begin{bmatrix} R_{\text{bilinear}} \\ I \end{bmatrix}, \quad
+D_{\text{block}} = \begin{bmatrix} D_{\text{bilinear}} & I \end{bmatrix}$$
+
+---
+
+## 5. Updated TN-Similarity
+
+### 5.1 Standard (No Residual)
+
+$$\langle A | B \rangle = \text{Tr}\left(D_A \cdot \text{core}(A, B) \cdot D_B^\top\right)$$
+
+where:
+$$\text{core}(A, B) = \frac{1}{2}\left[(L_A^\top L_B)(R_A^\top R_B) + (L_A^\top R_B)(R_A^\top L_B)\right]$$
+
+### 5.2 With Residual (Post-Norm or No-Norm)
+
+Use the concatenated factorization. The inner product becomes:
+
+$$\langle A | B \rangle_{\text{+res}} = \langle A_{\text{bilinear}} | B_{\text{bilinear}} \rangle + \langle A_{\text{res}} | B_{\text{res}} \rangle + 2\langle A_{\text{bilinear}} | B_{\text{res}} \rangle$$
+
+The cross-term $\langle A_{\text{bilinear}} | B_{\text{res}} \rangle$ measures how much the learned bilinear component aligns with the residual.
+
+**For pure residual (identity):**
+$$\langle \text{res} | \text{res} \rangle = d^2 \quad \text{(input dimension squared)}$$
+
+### 5.3 With Pre-Norm Residual
+
+Same structure, but $T^{(\text{res})}$ is now the $x\|x\|^2$ tensor:
+
+$$L_{\text{res}} = R_{\text{res}} = D_{\text{res}} = I$$
+
+The cross-term now measures alignment between the bilinear computation and the "identity times norm-squared" operation.
+
+---
+
+## 6. Implementation
+
+```python
+def tn_inner_product_with_residual(
+    A: BilinearWeights, 
+    B: BilinearWeights,
+    include_residual: bool = True,
+    prenorm_residual: bool = True,  # x||x||^2 vs just x
+) -> torch.Tensor:
+    """
+    TN inner product including residual connection.
+    
+    The residual is represented as:
+    - Post-norm/no-norm: L=R=0, D=I (identity shortcut)
+    - Pre-norm: L=R=D=I (x||x||^2 tensor)
+    """
+    # Bilinear-bilinear term (standard)
+    inner_bb = tn_inner_product(A, B)
+    
+    if not include_residual:
+        return inner_bb
+    
+    P = A.output_dim  # Assumes square residual (input_dim == output_dim)
+    device = A.w_l.device
+    
+    if prenorm_residual:
+        # Residual tensor: L=R=D=I
+        # core_res = (I^T I) * (I^T I) = I * I = I (element-wise)
+        # <res|res> = Tr(I @ I @ I^T) = Tr(I) = P
+        inner_rr = P  # Simplified
+        
+        # Cross terms: <bilinear | res>
+        # core_cross = 0.5 * ((L^T I)(R^T I) + (L^T I)(R^T I))
+        #            = 0.5 * (L^T * R^T + L^T * R^T) [element-wise on hidden]
+        #            = L^T * R^T [summed over hidden]
+        # Then contract with D @ I^T = D
+        
+        # <A_bilinear | res> = sum_h (sum_i L[h,i] * R[h,i]) * (sum_j D[j,h])
+        LR_elementwise = (A.w_l * A.w_r).sum(dim=1)  # (d_hidden,)
+        D_colsum = A.w_p.sum(dim=0)  # (d_hidden,)
+        cross_A = (LR_elementwise * D_colsum).sum()
+        
+        LR_elementwise_B = (B.w_l * B.w_r).sum(dim=1)
+        D_colsum_B = B.w_p.sum(dim=0)
+        cross_B = (LR_elementwise_B * D_colsum_B).sum()
+        
+        inner_br = cross_A  # <A|res>
+        inner_rb = cross_B  # <res|B> = <B|res> by symmetry
+        
+    else:
+        # Simple residual: just identity skip
+        # This is degenerate (rank-0 in bilinear sense)
+        # <res|res> = ||I||_F^2 = P
+        inner_rr = P
+        inner_br = 0  # Orthogonal to any bilinear with hidden_dim > 0
+        inner_rb = 0
+    
+    # Full inner product
+    # |A+res><B+res| = <A|B> + <A|res> + <res|B> + <res|res>
+    return inner_bb + inner_br + inner_rb + inner_rr
+
+
+def tn_similarity_with_residual(
+    A: BilinearWeights,
+    B: BilinearWeights,
+    include_residual: bool = True,
+    prenorm_residual: bool = True,
+) -> torch.Tensor:
+    """TN cosine similarity including residual."""
+    inner = tn_inner_product_with_residual(A, B, include_residual, prenorm_residual)
+    norm_A = torch.sqrt(tn_inner_product_with_residual(A, A, include_residual, prenorm_residual))
+    norm_B = torch.sqrt(tn_inner_product_with_residual(B, B, include_residual, prenorm_residual))
+    return inner / (norm_A * norm_B + 1e-8)
+```
+
+---
+
+## 7. Summary Table
+
+| Component | Tensor Order | Factorization $(L, R, D)$ | Notes |
+|-----------|-------------|---------------------------|-------|
+| Bilinear $D[(Lx) \odot (Rx)]$ | 3 | $(L, R, D)$ | Standard |
+| Identity residual | 2 → 3 | Use constant wire trick | Pad with $\mathbf{0}$ |
+| Pre-norm residual $x\|x\|^2$ | 3 | $(I, I, I)$ | Natural 3rd-order |
+| Combined block | 3 | Concatenate hidden dims | $d_h \to d_h + d_{\text{res}}$ |
+
+---
+
+## 8. Conservation Laws with Residuals?
+
+Open question: Does Zach's conservation law extend to the concatenated tensor?
+
+**Conjecture:** If we treat the residual as frozen (which it is—identity doesn't train), then:
+- The bilinear portion still satisfies $\frac{d}{dt}(L^\top L - R^\top R) = 0$
+- The cross-terms $\langle \text{bilinear} | \text{residual} \rangle$ evolve but don't break conservation
+
+The residual acts like an "anchor" in tensor space that the bilinear component moves relative to.
