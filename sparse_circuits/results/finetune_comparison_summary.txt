@@ -1,0 +1,11 @@
+Fine-tune Comparison Summary
+============================
+All at 90% magnitude pruning, lr=0.0001, 5000 steps
+
+                          Pre-prune   Post-prune  Fine-tuned
+Original model:           0.7984
+A (Phase3 λ=10 + ft):    0.7209      0.7366       0.7818
+B (Phase2 + ft weights):  0.7972      0.7264       0.8465
+C (Phase2 + ft w+rot):    0.7972      0.7264       0.8427
+
+Sparsity: all ~90% pruned

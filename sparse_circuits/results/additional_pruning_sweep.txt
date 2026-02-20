@@ -1,0 +1,42 @@
+Additional Pruning Sweep on Fine-tuned Sparse Model
+====================================================
+Starting from: 84.3% accuracy, 10% dense (20,855 / 208,540 nonzero)
+
+Question: how much further can we prune the already-sparse model?
+
+--- Global threshold (percentile of all nonzero weights) ---
+  pctile  threshold      nnz  % dense   accuracy  layers [L0, L1, L2]
+       0     0.0000    20855    10.0%     0.8433   [19158, 1507, 190]
+      25     0.0233    15641     7.5%     0.8078   [14548,  996,  97]
+      50     0.0356    10427     5.0%     0.6303   [ 9816,  540,  71]
+      70     0.0514     6257     3.0%     0.5254   [ 5934,  271,  52]
+      90     0.0860     2086     1.0%     0.5103   [ 1927,  125,  34]
+      98     0.1500      418     0.2%     0.3575   [  315,   81,  22]
+
+--- Per-layer threshold (percentile within each layer) ---
+  pctile      nnz  % dense   accuracy  layers [L0, L1, L2]
+       0    20855    10.0%     0.8433   [19158, 1507, 190]
+      25    15640     7.5%     0.8103   [14368, 1130, 142]
+      50    10427     5.0%     0.6349   [ 9579,  753,  95]
+      70     6257     3.0%     0.5501   [ 5748,  452,  57]
+      90     2086     1.0%     0.5096   [ 1916,  151,  19]
+      98      418     0.2%     0.2884   [  384,   30,   4]
+
+Key observations:
+- Global and per-layer give nearly identical results
+- Accuracy is robust up to 25th pctile (7.5% dense): 80.8%
+- Sharp cliff between 25th and 50th pctile: 80.8% -> 63.0%
+- Below 50th pctile, degrades slowly to ~50% (still above chance=10%)
+- The top 25% of nonzero weights carry almost all the accuracy
+
+Layer distribution note:
+- Layer 0 (47->60) dominates: 92% of all nonzero weights
+- At any pruning level, L0 retains most weights, L2 retains fewest
+- Global pruning naturally removes more from L0 (bigger layer)
+  while per-layer pruning is proportional within each layer
+- In practice, very similar results either way
+
+Conclusion: the model has a clear "important core" of ~15k weights
+(7.5% dense) that preserves 80%+ accuracy. Below that, accuracy
+drops steeply. The remaining 5k weights (from 15k to 21k) provide
+the final 3.5% accuracy boost from 80.8% to 84.3%.

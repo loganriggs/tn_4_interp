@@ -1,0 +1,14 @@
+Fine-tune Pruned Model Summary
+==============================
+Model: chi_net_L3_h256
+Phase 3 config: lambda=10, 1x expansion
+Pruning: 90% magnitude threshold
+
+Accuracy progression:
+  Original model:         0.7984
+  ODT truncated:          0.7972
+  Phase 3 (lambda=10):    0.7209
+  After 90% pruning:      0.7366
+  After fine-tuning:      0.7359  (-0.0007)
+
+Sparsity: 90.0% pruned (20854/208540 nonzero)

@@ -1,0 +1,29 @@
+Expansion × Lambda Pareto Sweep Results
+========================================
+
+Config               Fidelity   Sparsity   Ranks
+----------------------------------------------------------------------
+No rotation            1.0000     0.7219   [47, 60, 20, 10]
+Phase 2 (rot only)     1.0000     0.7938   [47, 60, 20, 10]
+1x, λ=1                0.9279     0.9096   [47, 60, 20, 10]
+1x, λ=10               0.9978     0.7505   [47, 60, 20, 10]
+2x, λ=1                0.9905     0.9486   [94, 120, 40, 20]
+2x, λ=10               0.9998     0.9291   [94, 120, 40, 20]
+4x, λ=1                0.9990     0.9836   [188, 240, 80, 40]
+4x, λ=10               1.0000     0.9817   [188, 240, 80, 40]
+
+Fidelity = tensor similarity to original (1 = identical)
+Sparsity = Hoyer score (1 = one-hot sparse)
+Upper-right = best on the Pareto plot.
+
+Key takeaway: expansion dominates lambda. At 4x you get 98% Hoyer
+with ~zero fidelity cost. But this is somewhat trivially explained
+by the zeros — the expanded cores embed the original in a much
+larger (mostly-zero) tensor. The real test is expanding h in the
+original L/D/R parametrization, where new hidden dims actually
+need to learn useful decompositions.
+
+Also added early stopping (patience=100, rtol=1e-4) to run_phase3
+since everything converges by ~200-400 steps.
+
+Plot saved to: chi_net_L3_h256_pareto_frontier.png
