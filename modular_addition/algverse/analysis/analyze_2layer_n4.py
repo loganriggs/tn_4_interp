@@ -1,22 +1,9 @@
 # %%
 """
-2-Layer Symmetric Bilinear Analysis for n=4
+2-Layer n=4 + 1 Memory Analysis
 
-Computational paths:
-  output = x + r1 + r2
-
-Where r1 = layer1(norm1(x)) and r2 = layer2(norm2(x + r1))
-
-We can decompose r2 into 3 parts based on the bilinear expansion:
-  h2 = norm2(x + r1)
-
-If we linearly approximate: h2 ≈ a*x_norm + b*r1_norm (ignoring norm interaction)
-Then (L2 @ h2)² expands to:
-  A: (L2 @ x_component)² term
-  B: 2*(L2 @ x_component)*(L2 @ r1_component) cross term
-  C: (L2 @ r1_component)² term
-
-So 5 paths total: x, r1, A, B, C
+Loads the sparse 2-layer n=4 model with 1 memory dimension.
+Visualizes weights, M matrices, and A/B/C decomposition.
 """
 
 import torch
@@ -25,440 +12,324 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys
-from itertools import combinations
+import pickle
 
-# =============================================================================
-# PROJECT ROOT
-# =============================================================================
 PROJECT_ROOT = Path("/workspace/tn_4_interp/modular_addition/algverse")
 sys.path.insert(0, str(PROJECT_ROOT))
-from models import task_2nd_argmax
+from models import SymmetricBilinearResidual, task_2nd_argmax
 from analysis.analysis_utils import (
-    compute_quadratic_forms, bilinear_forward, rmsnorm,
-    plot_weight_matrix, plot_quadratic_forms, print_quadratic_analysis,
-    powerset_ablation, removal_ablation
+    compute_quadratic_forms, plot_mat, plot_weights, plot_M_eigen, plot_M_only
 )
 
 checkpoint_dir = PROJECT_ROOT / "checkpoints"
-images_dir = PROJECT_ROOT / "images"
+images_dir = PROJECT_ROOT / "images" / "2layer_n4_memory"
+images_dir.mkdir(exist_ok=True, parents=True)
+
+N_TASK = 4
+N_MODEL = 5
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # %%
 # =============================================================================
-# LOAD CHECKPOINT (sparse model from L1 pruning)
+# LOAD SPARSE MODEL
 # =============================================================================
-import pickle
+checkpoint_path = checkpoint_dir / "2layer_n4_memory1_sparse.pkl"
+print(f"Loading sparse model from {checkpoint_path}")
 
-prune_path = checkpoint_dir / "prune_symmetric_results.pkl"
-print(f"Loading sparse model from {prune_path}")
+with open(checkpoint_path, 'rb') as f:
+    checkpoint = pickle.load(f)
 
-with open(prune_path, 'rb') as f:
-    prune_data = pickle.load(f)
+state = checkpoint['state_dict']
+config = checkpoint['config']
 
-# Get the best sparse result
-best_result = max(prune_data['results'], key=lambda x: x['final_acc'])
-cfg = prune_data['config']
-state = best_result['state_dict']
-acc = best_result['final_acc']
-sparsity_info = best_result['sparsity']
-
-print(f"Threshold: {best_result['threshold']}")
-print(f"Sparsity: L1={sparsity_info['L1']:.0%}, D1={sparsity_info['D1']:.0%}, "
-      f"L2={sparsity_info['L2']:.0%}, D2={sparsity_info['D2']:.0%}")
-
-n = cfg['n']
-rank = cfg['rank']
-num_layers = cfg['num_layers']
-seed = cfg['seed']
+print(f"\nConfig: n_task={config['n_task']}, n_model={config['n_model']}, rank={config['rank']}")
+print(f"Accuracy: {checkpoint['accuracy']*100:.1f}%")
+print(f"Sparsity: {checkpoint.get('sparsity', 0)*100:.1f}%")
+print(f"Baseline: {checkpoint.get('baseline_acc', checkpoint['accuracy'])*100:.1f}%")
 
 # Extract weights
 L1 = state['layers.0.L']
 D1 = state['layers.0.D']
-norm1_w = state['norms.0.weight']
+gamma1 = state['norms.0.weight']
 
 L2 = state['layers.1.L']
 D2 = state['layers.1.D']
-norm2_w = state['norms.1.weight']
+gamma2 = state['norms.1.weight']
 
-print(f"Config: n={n}, layers={num_layers}, rank={rank}, seed={seed}")
-print(f"Accuracy: {acc:.1%}")
-
-# %%
-# =============================================================================
-# WEIGHT VISUALIZATION
-# =============================================================================
-print("\n" + "="*60)
-print("WEIGHT VISUALIZATION")
-print("="*60)
-
-fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-
-def plot_weights(ax, mat, title):
-    mat_np = mat.numpy()
-    vmax = max(abs(mat_np.min()), abs(mat_np.max()))
-    if vmax == 0:
-        vmax = 1
-    im = ax.imshow(mat_np, cmap='RdBu_r', vmin=-vmax, vmax=vmax, aspect='auto')
-    ax.set_title(title, fontsize=10)
-    for i in range(mat_np.shape[0]):
-        for j in range(mat_np.shape[1]):
-            val = mat_np[i, j]
-            color = 'white' if abs(val) > vmax * 0.5 else 'black'
-            ax.text(j, i, f'{val:.2f}', ha='center', va='center', fontsize=7, color=color)
-    plt.colorbar(im, ax=ax, shrink=0.8)
-
-# Layer 1
-plot_weights(axes[0, 0], L1, f'L1 ({rank}×{n})')
-plot_weights(axes[0, 1], D1, f'D1 ({n}×{rank})')
-plot_weights(axes[0, 2], D1 @ L1, f'D1 @ L1 [NOT effective!]')
-
-# Layer 2
-plot_weights(axes[1, 0], L2, f'L2 ({rank}×{n})')
-plot_weights(axes[1, 1], D2, f'D2 ({n}×{rank})')
-plot_weights(axes[1, 2], D2 @ L2, f'D2 @ L2 [NOT effective!]')
-
-axes[0, 0].set_ylabel('Layer 1', fontsize=12, fontweight='bold')
-axes[1, 0].set_ylabel('Layer 2', fontsize=12, fontweight='bold')
-
-plt.suptitle(f'2-Layer Weights: n={n}, seed={seed}', fontsize=12)
-plt.tight_layout()
-plt.savefig(images_dir / f'2layer_n{n}_weights.png', dpi=150)
-plt.show()
+print(f"\nWeight shapes:")
+print(f"  L1: {L1.shape}, D1: {D1.shape}, gamma1: {gamma1.item():.4f}")
+print(f"  L2: {L2.shape}, D2: {D2.shape}, gamma2: {gamma2.item():.4f}")
 
 # %%
 # =============================================================================
-# QUADRATIC FORM ANALYSIS (THE CORRECT MATH)
+# SPARSITY ANALYSIS
 # =============================================================================
-print("\n" + "="*60)
+print("\n" + "=" * 60)
+print("SPARSITY ANALYSIS")
+print("=" * 60)
+
+def analyze_sparsity(tensor, name):
+    zeros = (tensor == 0).sum().item()
+    total = tensor.numel()
+    sparsity = zeros / total * 100
+    print(f"  {name}: {sparsity:.1f}% sparse ({zeros}/{total} zeros)")
+    return sparsity
+
+print("\nPer-layer sparsity:")
+sp_L1 = analyze_sparsity(L1, "L1")
+sp_D1 = analyze_sparsity(D1, "D1")
+sp_L2 = analyze_sparsity(L2, "L2")
+sp_D2 = analyze_sparsity(D2, "D2")
+
+# %%
+# =============================================================================
+# MEMORY DIMENSION USAGE
+# =============================================================================
+print("\n" + "=" * 60)
+print("MEMORY DIMENSION (pos 4) USAGE")
+print("=" * 60)
+
+L1_col4 = L1[:, 4]
+print(f"\nL1 column 4 (memory input -> ranks):")
+print(f"  Non-zero: {(L1_col4 != 0).sum().item()}/{len(L1_col4)}")
+print(f"  Values: {L1_col4.numpy()}")
+
+D1_row4 = D1[4, :]
+print(f"\nD1 row 4 (ranks -> memory output):")
+print(f"  Non-zero: {(D1_row4 != 0).sum().item()}/{len(D1_row4)}")
+print(f"  Values: {D1_row4.numpy()}")
+
+L2_col4 = L2[:, 4]
+print(f"\nL2 column 4 (L1 memory output -> L2 ranks):")
+print(f"  Non-zero: {(L2_col4 != 0).sum().item()}/{len(L2_col4)}")
+print(f"  Values: {L2_col4.numpy()}")
+
+D2_row4 = D2[4, :]
+print(f"\nD2 row 4 (ranks -> final memory, unused):")
+print(f"  Non-zero: {(D2_row4 != 0).sum().item()}/{len(D2_row4)}")
+
+# %%
+# =============================================================================
+# QUADRATIC FORM ANALYSIS
+# =============================================================================
+print("\n" + "=" * 60)
 print("QUADRATIC FORM ANALYSIS")
-print("="*60)
-print("""
-Key insight: Each bilinear layer computes D @ (L @ h)² where ² is ELEMENTWISE.
-This creates QUADRATIC FORMS:
+print("=" * 60)
 
-    bilinear_i = h^T M^(i) h
-
-where M^(i)_jk = Σ_r D_ir L_rj L_rk is a symmetric matrix for each output i.
-""")
-
-# Compute quadratic form matrices for both layers
 M1 = compute_quadratic_forms(L1, D1)
 M2 = compute_quadratic_forms(L2, D2)
 
-print(f"M1 shape: {M1.shape} (Layer 1: {n} matrices of size {n}×{n})")
-print(f"M2 shape: {M2.shape} (Layer 2: {n} matrices of size {n}×{n})")
+print(f"\nM1 (layer 1 quadratic forms): {M1.shape}")
+print(f"M2 (layer 2 quadratic forms): {M2.shape}")
 
-# Print analysis for both layers
-print_quadratic_analysis(M1, "Layer 1")
-print_quadratic_analysis(M2, "Layer 2")
-
-# Visualize quadratic form matrices
-fig1 = plot_quadratic_forms(M1, title_prefix="M1", save_path=images_dir / f'2layer_n{n}_M1_quadforms.png')
-plt.show()
-
-fig2 = plot_quadratic_forms(M2, title_prefix="M2", save_path=images_dir / f'2layer_n{n}_M2_quadforms.png')
-plt.show()
+for M, name in [(M1, 'M1'), (M2, 'M2')]:
+    print(f"\n{name} structure:")
+    for i in range(N_MODEL):
+        M_i = M[i].numpy()
+        eigenvalues = np.linalg.eigvalsh(M_i)
+        rank = np.sum(np.abs(eigenvalues) > 1e-6)
+        label = f'mem' if i >= N_TASK else str(i)
+        print(f"  {name}[{label}]: self={M_i[i,i]:+.3f}, rank={rank}, top_eig={eigenvalues[-1]:.3f}")
 
 # %%
 # =============================================================================
-# COMPUTE 5 COMPONENT PATHS
+# FORWARD PASS AND ABLATION
 # =============================================================================
-def compute_5_paths(x):
-    """
-    Compute the 5 computational paths:
-    - x: input (residual)
-    - r1: layer 1 output
-    - A: x contribution through layer 2
-    - B: cross term in layer 2
-    - C: r1 contribution through layer 2
+print("\n" + "=" * 60)
+print("FORWARD PASS AND ABLATION")
+print("=" * 60)
 
-    Returns dict with all components.
-    """
-    batch = x.shape[0]
+model = SymmetricBilinearResidual(N_MODEL, 2, config['rank']).to(device)
+model.load_state_dict({k: v.to(device) for k, v in state.items()})
+model.eval()
 
-    # Layer 1
-    rms1 = torch.sqrt((x ** 2).mean(dim=-1, keepdim=True) + 1e-6)
-    h1 = norm1_w * (x / rms1)
-    Lh1 = h1 @ L1.T
-    r1 = (Lh1 ** 2) @ D1.T
+def my_rmsnorm(x, gamma):
+    rms = (x ** 2).mean(dim=-1, keepdim=True).sqrt()
+    return gamma * x / rms, rms.squeeze(-1)
 
-    # After layer 1
+def forward_2layer_memory(x_task):
+    x = torch.cat([x_task, torch.zeros(x_task.shape[0], 1, device=x_task.device)], dim=1)
+    h1, rms1 = my_rmsnorm(x, gamma1.to(x.device))
+    Lh1 = h1 @ L1.T.to(x.device)
+    r1 = (Lh1 ** 2) @ D1.T.to(x.device)
     h_mid = x + r1
-
-    # Layer 2 - full computation
-    rms2 = torch.sqrt((h_mid ** 2).mean(dim=-1, keepdim=True) + 1e-6)
-    h2 = norm2_w * (h_mid / rms2)
-    Lh2 = h2 @ L2.T
-    r2_full = (Lh2 ** 2) @ D2.T
-
-    # Decompose layer 2 into A, B, C
-    # h2 = norm2_w * (x + r1) / rms2
-    # Let's compute x and r1 contributions separately through the norm
-    # x_contrib = norm2_w * x / rms2
-    # r1_contrib = norm2_w * r1 / rms2
-
-    x_contrib = norm2_w * x / rms2
-    r1_contrib = norm2_w * r1 / rms2
-
-    # L2 projections
-    Lx = x_contrib @ L2.T   # (batch, rank)
-    Lr1 = r1_contrib @ L2.T  # (batch, rank)
-
-    # A: (Lx)² term
-    A = (Lx ** 2) @ D2.T
-
-    # C: (Lr1)² term
-    C = (Lr1 ** 2) @ D2.T
-
-    # B: 2 * Lx * Lr1 cross term
-    B = (2 * Lx * Lr1) @ D2.T
-
-    # Verify: A + B + C should equal r2_full (approximately, up to norm interactions)
-    r2_reconstructed = A + B + C
-
-    # Full output
-    output = x + r1 + r2_full
-
-    return {
-        'x': x,
-        'r1': r1,
-        'A': A,
-        'B': B,
-        'C': C,
-        'r2_full': r2_full,
-        'r2_reconstructed': r2_reconstructed,
-        'output': output,
-    }
-
-# %%
-# =============================================================================
-# POWERSET ABLATION
-# =============================================================================
-print("\n" + "="*60)
-print("POWERSET ABLATION (all 32 combinations)")
-print("="*60)
+    h2, rms2 = my_rmsnorm(h_mid, gamma2.to(x.device))
+    Lh2 = h2 @ L2.T.to(x.device)
+    r2 = (Lh2 ** 2) @ D2.T.to(x.device)
+    output = x + r1 + r2
+    return output, r1, r2
 
 torch.manual_seed(123)
-x_eval = torch.randn(10000, n)
-targets = task_2nd_argmax(x_eval)
-paths = compute_5_paths(x_eval)
+x_task = torch.randn(10000, N_TASK, device=device)
+targets = task_2nd_argmax(x_task)
 
-# Component names
-components = ['x', 'r1', 'A', 'B', 'C']
+output, r1, r2 = forward_2layer_memory(x_task)
+preds = output[:, :N_TASK].argmax(dim=1)
+accuracy = (preds == targets).float().mean().item()
 
-# Store results
-ablation_results = []
+x_padded = torch.cat([x_task, torch.zeros(10000, 1, device=device)], dim=1)
+r1_task = r1[:, :N_TASK]
+r2_task = r2[:, :N_TASK]
 
-# Try all 32 combinations (powerset)
-for num_active in range(6):  # 0 to 5 components
-    for combo in combinations(range(5), num_active):
-        # Build output from selected components
-        output = torch.zeros_like(x_eval)
-        active_names = []
-        for i in combo:
-            output = output + paths[components[i]]
-            active_names.append(components[i])
+print(f"\nModel accuracy: {accuracy:.1%}")
 
-        if len(active_names) == 0:
-            active_names = ['none']
+print(f"\nNorm contributions (mean):")
+print(f"  ||x_task||: {x_task.norm(dim=1).mean().item():.4f}")
+print(f"  ||r1_task||: {r1_task.norm(dim=1).mean().item():.4f}")
+print(f"  ||r2_task||: {r2_task.norm(dim=1).mean().item():.4f}")
+print(f"  |r1_mem|: {r1[:, N_TASK].abs().mean().item():.4f}")
+print(f"  |r2_mem|: {r2[:, N_TASK].abs().mean().item():.4f}")
 
-        preds = output.argmax(dim=1)
-        acc = (preds == targets).float().mean().item()
+print(f"\nProgressive accuracy:")
+print(f"  x only:      {(x_task.argmax(dim=1) == targets).float().mean().item():.1%}")
+print(f"  x + r1_task: {((x_task + r1_task).argmax(dim=1) == targets).float().mean().item():.1%}")
+print(f"  x + r1 + r2: {accuracy:.1%}")
 
-        ablation_results.append({
-            'components': tuple(active_names),
-            'num_components': len(combo),
-            'accuracy': acc,
-        })
-
-# Sort by accuracy
-ablation_results.sort(key=lambda x: -x['accuracy'])
-
-print(f"\n{'Components':<30} {'Acc':>8}")
-print("-" * 40)
-for r in ablation_results:
-    comp_str = '+'.join(r['components'])
-    print(f"{comp_str:<30} {r['accuracy']*100:>7.1f}%")
+print(f"\nAblation (removing components):")
+print(f"  Without r1 (x + r2_task):  {((x_task + r2_task).argmax(dim=1) == targets).float().mean().item():.1%}")
+print(f"  Without r2 (x + r1_task):  {((x_task + r1_task).argmax(dim=1) == targets).float().mean().item():.1%}")
 
 # %%
 # =============================================================================
-# KEY ABLATION INSIGHTS
+# PER-POSITION ACCURACY
 # =============================================================================
-print("\n" + "="*60)
-print("KEY ABLATION INSIGHTS")
-print("="*60)
+print("\n" + "=" * 60)
+print("PER-POSITION ACCURACY")
+print("=" * 60)
 
-# Full model
-full_acc = paths['output'].argmax(dim=1).eq(targets).float().mean().item()
-print(f"\nFull model (x+r1+A+B+C): {full_acc:.1%}")
+confusion = torch.zeros(N_TASK, N_TASK)
+for t in range(N_TASK):
+    mask = (targets == t)
+    if mask.sum() > 0:
+        preds_t = preds[mask]
+        for p in range(N_TASK):
+            confusion[t, p] = (preds_t == p).sum().item()
 
-# Find most important single component
-single_results = [r for r in ablation_results if r['num_components'] == 1]
-print("\nSingle component accuracies:")
-for r in single_results:
-    print(f"  {r['components'][0]}: {r['accuracy']:.1%}")
-
-# Remove one at a time from full
-print("\nRemove one component from full:")
-for comp in components:
-    remaining = [c for c in components if c != comp]
-    output = sum(paths[c] for c in remaining)
-    acc = output.argmax(dim=1).eq(targets).float().mean().item()
-    delta = acc - full_acc
-    print(f"  Without {comp}: {acc:.1%} (Δ={delta*100:+.1f}%)")
+print("\nPer-position accuracy:")
+for t in range(N_TASK):
+    total = confusion[t].sum().item()
+    correct = confusion[t, t].item()
+    acc = correct / total if total > 0 else 0
+    print(f"  Position {t}: {acc:.1%} ({int(correct)}/{int(total)})")
+print(f"\nOverall: {accuracy:.1%}")
 
 # %%
 # =============================================================================
-# EXAMPLE VISUALIZATION FUNCTION
+# R2 DECOMPOSITION INTO A, B, C
 # =============================================================================
-def plot_example_2layer(x_i, target, full_pred, title=""):
-    """Plot 2-layer computation flow."""
-    x_t = torch.tensor(x_i).unsqueeze(0)
-    paths_i = compute_5_paths(x_t)
+print("\n" + "=" * 60)
+print("R2 DECOMPOSITION: A (x*x), B (x*r1 cross), C (r1*r1)")
+print("=" * 60)
 
-    # Extract all components
-    x_np = x_i.reshape(1, -1)
-    r1_np = paths_i['r1'].numpy()
-    A_np = paths_i['A'].numpy()
-    B_np = paths_i['B'].numpy()
-    C_np = paths_i['C'].numpy()
-    output_np = paths_i['output'].numpy()
+def compute_r2_ABC(x_task):
+    device = x_task.device
+    x = torch.cat([x_task, torch.zeros(x_task.shape[0], 1, device=device)], dim=1)
+    rms1 = (x ** 2).mean(dim=-1, keepdim=True).sqrt()
+    h1 = gamma1.to(device) * x / rms1
+    Lh1 = h1 @ L1.T.to(device)
+    r1 = (Lh1 ** 2) @ D1.T.to(device)
+    h_mid = x + r1
+    rms2 = (h_mid ** 2).mean(dim=-1, keepdim=True).sqrt()
+    x_norm = gamma2.to(device) * x / rms2
+    r1_norm = gamma2.to(device) * r1 / rms2
+    L2_dev, D2_dev = L2.to(device), D2.to(device)
+    Lx = x_norm @ L2_dev.T
+    Lr1 = r1_norm @ L2_dev.T
+    r2_A = (Lx ** 2) @ D2_dev.T
+    r2_B = (2 * Lx * Lr1) @ D2_dev.T
+    r2_C = (Lr1 ** 2) @ D2_dev.T
+    return r2_A, r2_B, r2_C, r1
 
-    # Create figure
-    fig, axes = plt.subplots(6, 1, figsize=(10, 10),
-                              gridspec_kw={'height_ratios': [1, 1, 1, 1, 1, 1]})
+r2_A, r2_B, r2_C, _ = compute_r2_ABC(x_task)
 
-    def plot_row(ax, data, title, vmax=None):
-        if vmax is None:
-            vmax = max(abs(data.min()), abs(data.max()))
-            if vmax == 0:
-                vmax = 1
-        im = ax.imshow(data, cmap='RdBu_r', vmin=-vmax, vmax=vmax, aspect='auto')
-        ax.set_title(title, fontsize=9, loc='left')
-        ax.set_xticks(range(data.shape[1]))
-        ax.set_yticks([])
-        for j in range(data.shape[1]):
-            val = data[0, j]
-            color = 'white' if abs(val) > vmax * 0.5 else 'black'
-            ax.text(j, 0, f'{val:.2f}', ha='center', va='center', fontsize=8, color=color)
+reconstruction_error = (r2 - (r2_A + r2_B + r2_C)).abs().max().item()
+print(f"\nReconstruction check: max|r2 - (A+B+C)| = {reconstruction_error:.2e}")
 
-        # Mark target and prediction
-        rect_t = plt.Rectangle((target - 0.5, -0.5), 1, 1,
-                               fill=False, edgecolor='green', linewidth=2)
-        ax.add_patch(rect_t)
-        if full_pred != target:
-            rect_p = plt.Rectangle((full_pred - 0.5, -0.5), 1, 1,
-                                   fill=False, edgecolor='red', linewidth=2, linestyle='--')
-            ax.add_patch(rect_p)
-        return im
+print(f"\nComponent magnitudes (task outputs):")
+print(f"  ||A|| (x*x):     {r2_A[:, :N_TASK].norm(dim=1).mean().item():.4f}")
+print(f"  ||B|| (x*r1):    {r2_B[:, :N_TASK].norm(dim=1).mean().item():.4f}")
+print(f"  ||C|| (r1*r1):   {r2_C[:, :N_TASK].norm(dim=1).mean().item():.4f}")
+print(f"  ||r2|| (total):  {r2[:, :N_TASK].norm(dim=1).mean().item():.4f}")
 
-    # Find global vmax
-    all_data = np.concatenate([x_np, r1_np, A_np, B_np, C_np, output_np], axis=0)
-    vmax = max(abs(all_data.min()), abs(all_data.max()))
+print(f"\nAblation - accuracy with different r2 components:")
+for name, comp in [('A only', r2_A), ('B only', r2_B), ('C only', r2_C),
+                    ('A+B', r2_A+r2_B), ('A+C', r2_A+r2_C), ('B+C', r2_B+r2_C),
+                    ('A+B+C', r2_A+r2_B+r2_C)]:
+    out = x_padded + r1 + comp
+    acc = (out[:, :N_TASK].argmax(dim=1) == targets).float().mean().item()
+    print(f"  r2 = {name:8s}: {acc:.1%}")
 
-    plot_row(axes[0], x_np, 'x (input)', vmax)
-    plot_row(axes[1], r1_np, 'r1 = layer1(norm(x))', vmax)
-    plot_row(axes[2], A_np, 'A = (L2 @ x_norm)² @ D2 (x→layer2)', vmax)
-    plot_row(axes[3], B_np, 'B = 2*(L2@x)*(L2@r1) @ D2 (cross term)', vmax)
-    plot_row(axes[4], C_np, 'C = (L2 @ r1_norm)² @ D2 (r1→layer2)', vmax)
-    plot_row(axes[5], output_np, 'Output = x + r1 + A + B + C', vmax)
-    axes[5].set_xlabel('Position')
-
-    legend_text = f"Target: {target} (green)"
-    if full_pred != target:
-        legend_text += f" | Pred: {full_pred} (red)"
-
-    fig.suptitle(f'{title}\n{legend_text}', fontsize=11)
-    plt.tight_layout()
-    return fig
+acc_no_r2 = ((x_task + r1_task).argmax(dim=1) == targets).float().mean().item()
+print(f"  r2 = 0 (none):  {acc_no_r2:.1%}")
 
 # %%
 # =============================================================================
-# CATEGORIZE EXAMPLES
+# VISUALIZATIONS
 # =============================================================================
-print("\n" + "="*60)
-print("EXAMPLE CATEGORIES")
-print("="*60)
+print("\n" + "=" * 60)
+print("GENERATING VISUALIZATIONS")
+print("=" * 60)
 
-torch.manual_seed(42)
-x_sample = torch.randn(1000, n)
-targets_s = task_2nd_argmax(x_sample)
-paths_s = compute_5_paths(x_sample)
-
-# Get predictions from different component combinations
-full_preds = paths_s['output'].argmax(dim=1)
-no_x_preds = (paths_s['r1'] + paths_s['A'] + paths_s['B'] + paths_s['C']).argmax(dim=1)
-no_r1_preds = (paths_s['x'] + paths_s['A'] + paths_s['B'] + paths_s['C']).argmax(dim=1)
-xr1_only_preds = (paths_s['x'] + paths_s['r1']).argmax(dim=1)
-
-full_correct = (full_preds == targets_s)
-full_acc = full_correct.float().mean().item()
-print(f"Full model accuracy: {full_acc:.1%}")
-
-# %%
-# =============================================================================
-# EXAMPLE: Full model CORRECT
-# =============================================================================
-print("\n" + "="*60)
-print("EXAMPLE: Full Model CORRECT")
-print("="*60)
-
-correct_idx = torch.where(full_correct)[0][0].item()
-target = targets_s[correct_idx].item()
-pred = full_preds[correct_idx].item()
-
-fig = plot_example_2layer(
-    x_sample[correct_idx].numpy(),
-    target, pred,
-    f"Full Model CORRECT"
+# Weight matrices
+fig = plot_weights(
+    [(L1, D1, 'Layer1', sp_L1, sp_D1),
+     (L2, D2, 'Layer2', sp_L2, sp_D2)],
+    title=f'2-Layer n=4+1mem (Acc: {checkpoint["accuracy"]*100:.1f}%, Sparsity: {checkpoint.get("sparsity",0)*100:.1f}%)\nGreen line marks memory dimension (pos 4)',
+    memory_boundary=N_TASK,
+    save_path=images_dir / 'weights_all.png',
 )
-plt.show()
+plt.close()
+print("Saved weights_all.png")
 
-# %%
-# =============================================================================
-# EXAMPLE: Full model WRONG
-# =============================================================================
-print("\n" + "="*60)
-print("EXAMPLE: Full Model WRONG")
-print("="*60)
+# M matrices with eigendecomposition
+for M, name in [(M1, 'M1'), (M2, 'M2')]:
+    fig = plot_M_eigen(M, name, list(range(N_MODEL)), n_top=3,
+                       memory_boundary=N_TASK,
+                       save_path=images_dir / f'{name}_eigen_analysis.png')
+    plt.close()
+    print(f"Saved {name}_eigen_analysis.png")
 
-wrong_idx = torch.where(~full_correct)[0][0].item()
-target = targets_s[wrong_idx].item()
-pred = full_preds[wrong_idx].item()
+# M matrices only (side by side, task outputs)
+for M, name in [(M1, 'M1'), (M2, 'M2')]:
+    fig = plot_M_only(M, name, list(range(N_TASK)),
+                      memory_boundary=N_TASK,
+                      save_path=images_dir / f'{name}_matrices.png')
+    plt.close()
+    print(f"Saved {name}_matrices.png")
 
-fig = plot_example_2layer(
-    x_sample[wrong_idx].numpy(),
-    target, pred,
-    f"Full Model WRONG"
-)
-plt.show()
+print(f"\nVisualizations saved to {images_dir}/")
 
 # %%
 # =============================================================================
 # SUMMARY
 # =============================================================================
-print("\n" + "="*60)
+print("\n" + "=" * 60)
 print("SUMMARY")
-print("="*60)
+print("=" * 60)
 
-# Get top 5 and bottom 5 combinations
-print("\nTop 5 component combinations:")
-for r in ablation_results[:5]:
-    print(f"  {'+'.join(r['components'])}: {r['accuracy']:.1%}")
+RANK = config['rank']
+print(f"""
+2-Layer n=4 + 1 Memory Model (Sparse)
+=======================================
 
-print("\nBottom 5 component combinations:")
-for r in ablation_results[-5:]:
-    print(f"  {'+'.join(r['components'])}: {r['accuracy']:.1%}")
+Config: n_task={N_TASK}, n_model={N_MODEL}, rank={RANK}
+Accuracy: {accuracy:.1%} (baseline: {checkpoint.get('baseline_acc', checkpoint['accuracy'])*100:.1f}%)
+Sparsity: {checkpoint.get('sparsity', 0)*100:.1f}%
 
-# Most important components (by removal impact)
-print("\nComponent importance (accuracy drop when removed):")
-importance = []
-for comp in components:
-    remaining = [c for c in components if c != comp]
-    output = sum(paths[c] for c in remaining)
-    acc = output.argmax(dim=1).eq(targets).float().mean().item()
-    importance.append((comp, full_acc - acc))
-importance.sort(key=lambda x: -x[1])
-for comp, drop in importance:
-    print(f"  {comp}: {drop*100:+.1f}%")
+Per-layer sparsity:
+  L1: {sp_L1:.1f}%   D1: {sp_D1:.1f}%
+  L2: {sp_L2:.1f}%   D2: {sp_D2:.1f}%
+
+Memory dimension usage:
+  |r1_mem| mean: {r1[:, N_TASK].abs().mean().item():.4f}
+  |r2_mem| mean: {r2[:, N_TASK].abs().mean().item():.4f}
+
+Progressive accuracy:
+  x only:      {(x_task.argmax(dim=1) == targets).float().mean().item():.1%}
+  x + r1:      {((x_task + r1_task).argmax(dim=1) == targets).float().mean().item():.1%}
+  x + r1 + r2: {accuracy:.1%}
+
+Comparison to 1-layer n=4: 70.0% -> {accuracy:.1%} (+{accuracy - 0.70:.1%})
+""")
 
 # %%

@@ -496,3 +496,230 @@ def print_quadratic_analysis(M, layer_name="Layer"):
 def sparsity(tensor):
     """Compute sparsity (fraction of zeros) in a tensor."""
     return (tensor == 0).sum().item() / tensor.numel()
+
+
+# =============================================================================
+# SHARED PLOTTING FUNCTIONS (used across all analysis scripts)
+# =============================================================================
+
+def plot_mat(ax, mat, title, fontsize=None, cmap='RdBu_r', memory_boundary=None):
+    """
+    Plot matrix heatmap with values in cells. No colorbar.
+
+    Args:
+        ax: matplotlib axes
+        mat: numpy array or torch tensor
+        title: subplot title
+        fontsize: font size for cell values (auto-scaled if None)
+        cmap: colormap
+        memory_boundary: if set, draw green dashed line at this position
+    """
+    if isinstance(mat, torch.Tensor):
+        mat = mat.numpy()
+
+    vmax = max(abs(mat.min()), abs(mat.max()))
+    if vmax == 0:
+        vmax = 1
+
+    im = ax.imshow(mat, cmap=cmap, vmin=-vmax, vmax=vmax, aspect='equal')
+    ax.set_title(title, fontsize=12, fontweight='bold')
+
+    n = max(mat.shape)
+
+    # Auto font size based on matrix dimension
+    if fontsize is None:
+        if n <= 3:
+            fontsize = 14
+        elif n <= 5:
+            fontsize = 11
+        elif n <= 10:
+            fontsize = 9
+        elif n <= 15:
+            fontsize = 7
+        else:
+            fontsize = 5
+
+    # Show values in each cell
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            val = mat[i, j]
+            color = 'white' if abs(val) > vmax * 0.5 else 'black'
+            if abs(val) < 0.005:
+                txt = '0'
+            elif abs(val) < 10:
+                txt = f'{val:.2f}' if n <= 5 else f'{val:.1f}'
+            else:
+                txt = f'{val:.0f}'
+            ax.text(j, i, txt, ha='center', va='center',
+                    fontsize=fontsize, color=color)
+
+    # Memory boundary
+    if memory_boundary is not None:
+        ax.axhline(y=memory_boundary - 0.5, color='green', linestyle='--',
+                    linewidth=2, alpha=0.7)
+        ax.axvline(x=memory_boundary - 0.5, color='green', linestyle='--',
+                    linewidth=2, alpha=0.7)
+
+    ax.set_xticks(range(mat.shape[1]))
+    ax.set_yticks(range(mat.shape[0]))
+    ax.set_xlabel('pos', fontsize=10)
+    ax.set_ylabel('pos', fontsize=10)
+    return im
+
+
+def plot_weights(weights_dict, title='', save_path=None, memory_boundary=None,
+                 figsize=None):
+    """
+    Plot L and D weight matrices for all layers.
+
+    Args:
+        weights_dict: list of (L, D, layer_name, sparsity_L, sparsity_D) tuples
+        title: suptitle
+        save_path: path to save figure
+        memory_boundary: position of memory boundary line
+        figsize: optional figure size override
+    """
+    n_layers = len(weights_dict)
+    if figsize is None:
+        n = max(weights_dict[0][0].shape)
+        w = max(16, n * 1.8)
+        figsize = (w, 7 * n_layers)
+
+    fig, axes = plt.subplots(n_layers, 2, figsize=figsize)
+    if n_layers == 1:
+        axes = axes.reshape(1, -1)
+
+    for row, (L, D, name, sp_L, sp_D) in enumerate(weights_dict):
+        L_np = L.numpy() if isinstance(L, torch.Tensor) else L
+        D_np = D.numpy() if isinstance(D, torch.Tensor) else D
+        plot_mat(axes[row, 0], L_np,
+                 f'{name} L ({L_np.shape[0]}x{L_np.shape[1]}) - {sp_L:.0f}% sparse',
+                 memory_boundary=memory_boundary)
+        plot_mat(axes[row, 1], D_np,
+                 f'{name} D ({D_np.shape[0]}x{D_np.shape[1]}) - {sp_D:.0f}% sparse',
+                 memory_boundary=memory_boundary)
+
+    if title:
+        plt.suptitle(title, fontsize=14)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    return fig
+
+
+def plot_M_eigen(M_tensor, layer_name, outputs_to_show, n_top=3,
+                 memory_boundary=None, save_path=None, fontsize=None):
+    """
+    Plot M matrices with top eigenvalue outer products and eigenvalue spectrum.
+
+    Args:
+        M_tensor: (n_out, n, n) quadratic form matrices
+        layer_name: e.g. 'M1', 'M2'
+        outputs_to_show: list of output indices to plot
+        n_top: number of top eigenvalue outer products to show
+        memory_boundary: position of memory boundary line
+        save_path: path to save figure
+        fontsize: override font size for cell values
+    """
+    n_outputs = len(outputs_to_show)
+    n_model = M_tensor.shape[1]
+    n_cols = 1 + n_top + 1  # M + outer products + eigenvalue plot
+
+    if isinstance(M_tensor, torch.Tensor):
+        M_tensor = M_tensor.numpy()
+
+    fig = plt.figure(figsize=(7 * n_cols, 7 * n_outputs))
+
+    for idx, i in enumerate(outputs_to_show):
+        M_i = M_tensor[i]
+        eigenvalues, eigenvectors = np.linalg.eigh(M_i)
+        abs_order = np.argsort(np.abs(eigenvalues))[::-1]
+        eigenvalues_sorted = eigenvalues[abs_order]
+        eigenvectors_sorted = eigenvectors[:, abs_order]
+
+        # Column 0: M[i] matrix
+        ax0 = fig.add_subplot(n_outputs, n_cols, idx * n_cols + 1)
+        rank = np.sum(np.abs(eigenvalues) > 1e-6)
+        output_label = f'mem{i - memory_boundary}' if memory_boundary and i >= memory_boundary else str(i)
+        plot_mat(ax0, M_i, f'{layer_name}[{output_label}] (rank={rank})',
+                 fontsize=fontsize, memory_boundary=memory_boundary)
+
+        # Columns 1..n_top: outer products
+        for k in range(n_top):
+            ax = fig.add_subplot(n_outputs, n_cols, idx * n_cols + 2 + k)
+            if k < len(eigenvalues_sorted):
+                lam = eigenvalues_sorted[k]
+                v = eigenvectors_sorted[:, k:k+1]
+                outer = lam * (v @ v.T)
+                sign_str = "(NEG)" if lam < 0 else ""
+                plot_mat(ax, outer, f'\u03bb$_{k+1}$={lam:.2f} {sign_str}',
+                         fontsize=fontsize, memory_boundary=memory_boundary)
+                if lam < 0:
+                    ax.title.set_color('red')
+            else:
+                ax.set_visible(False)
+
+        # Last column: eigenvalue spectrum
+        ax_eig = fig.add_subplot(n_outputs, n_cols, idx * n_cols + n_cols)
+        ax_eig.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax_eig.plot(range(len(eigenvalues)), eigenvalues, marker='o',
+                    linestyle='-', color='steelblue', markersize=5)
+        neg_idx = np.where(eigenvalues < 0)[0]
+        if len(neg_idx) > 0:
+            ax_eig.scatter(neg_idx, eigenvalues[neg_idx], color='red', s=50,
+                          zorder=5, label='Negative')
+        pos_idx = np.where(eigenvalues >= 0)[0]
+        if len(pos_idx) > 0:
+            ax_eig.scatter(pos_idx, eigenvalues[pos_idx], color='blue', s=50,
+                          zorder=5, label='Positive')
+        ax_eig.set_title('Eigenvalues (sorted asc)', fontsize=10)
+        ax_eig.set_xlabel('Index')
+        ax_eig.set_ylabel('\u03bb')
+        ax_eig.grid(True, alpha=0.3)
+        if len(neg_idx) > 0 or len(pos_idx) > 0:
+            ax_eig.legend(fontsize=8)
+
+    plt.suptitle(
+        f'{layer_name} Quadratic Forms: M and Top {n_top} Outer Products '
+        f'(\u03bb\u00b7v\u00b7v\u1d40)',
+        fontsize=14)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    return fig
+
+
+def plot_M_only(M_tensor, layer_name='M', outputs_to_show=None,
+                memory_boundary=None, save_path=None, fontsize=None):
+    """
+    Plot just the M matrices side by side (no eigendecomposition).
+
+    Args:
+        M_tensor: (n_out, n, n) quadratic form matrices
+        layer_name: prefix for titles
+        outputs_to_show: list of indices (default: all)
+        memory_boundary: position of memory boundary line
+        save_path: path to save figure
+        fontsize: override font size
+    """
+    if isinstance(M_tensor, torch.Tensor):
+        M_tensor = M_tensor.numpy()
+
+    if outputs_to_show is None:
+        outputs_to_show = list(range(M_tensor.shape[0]))
+
+    n = len(outputs_to_show)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
+    if n == 1:
+        axes = [axes]
+
+    for idx, i in enumerate(outputs_to_show):
+        output_label = f'mem{i - memory_boundary}' if memory_boundary and i >= memory_boundary else str(i)
+        plot_mat(axes[idx], M_tensor[i],
+                 f'{layer_name}$^{{({output_label})}}$',
+                 fontsize=fontsize, memory_boundary=memory_boundary)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    return fig
