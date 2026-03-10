@@ -1,0 +1,315 @@
+================================================================================
+TENSOR NORM DECOMPOSITION: THEORY
+================================================================================
+
+1. SETUP
+========
+
+We have a 1-layer bilinear model with residual:
+
+  f(x) = W_res @ x + D @ ((L @ x) ⊙ (R @ x))
+         ^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         linear A    bilinear B
+
+In augmented space x̂ = [x, 1] (dim d+1), the full function becomes:
+
+  f(x) = D_aug @ ((L_aug @ x̂) ⊙ (R_aug @ x̂))
+
+where L_aug, R_aug, D_aug encode both the residual and bilinear parts.
+
+The corresponding degree-2 tensor is:
+
+  T[o, i, j] = sum_h D_aug[o,h] * 0.5*(L_aug[h,i]*R_aug[h,j] + L_aug[h,j]*R_aug[h,i])
+
+This is a symmetric tensor in (i,j) with output index o.
+
+
+2. TENSOR INNER PRODUCT
+========================
+
+For two such tensors with weights (L_a, R_a, D_a) and (L_b, R_b, D_b):
+
+  <T_a | T_b> = sum_{h_a, h_b} DD[h_a, h_b] * Core[h_a, h_b]
+
+where:
+  DD[h_a, h_b] = sum_o D_a[o, h_a] * D_b[o, h_b]  = (D_a^T D_b)[h_a, h_b]
+
+  Core[h_a, h_b] = 0.5 * (LL[h_a,h_b]*RR[h_a,h_b] + LR[h_a,h_b]*RL[h_a,h_b])
+
+  LL = L_a @ L_b^T,  RR = R_a @ R_b^T,  LR = L_a @ R_b^T,  RL = R_a @ L_b^T
+
+The Core formula comes from the S_2 symmetrization of degree-2 tensors.
+
+
+3. DECOMPOSITION INTO RESIDUAL + BILINEAR
+==========================================
+
+The augmented weights have block structure:
+
+  L_aug = [L_res; L_bil]    (H_res + H_bil) × (d+1)
+  R_aug = [R_res; R_bil]
+  D_aug = [D_res, D_bil]    n_out × (H_res + H_bil)
+
+where:
+  L_res[h, :] = e_{d+1}     (constant selector, for h = 0..783)
+  R_res[h, :] = e_h          (pixel selector)
+  D_res = W_res              (n_out × 784)
+  L_bil = [L_eff | 0]        (rank × (d+1))
+  R_bil = [R_eff | 0]
+  D_bil = D_eff              (n_out × rank)
+
+Since the hidden dimensions partition cleanly (residual uses dims 0..783,
+bilinear uses dims 784..783+rank), we have T = A + B exactly.
+
+
+4. DETAILED COMPUTATION OF SUB-NORMS
+======================================
+
+4a. ||A||² = <A|A> (residual self-norm)
+---------------------------------------
+
+  L_a = L_b = L_res, R_a = R_b = R_res, D_a = D_b = D_res
+
+  DD_AA[h_a, h_b] = (D_res^T D_res)[h_a, h_b]  = sum_o W_res[o,h_a] * W_res[o,h_b]
+
+  LL_AA[h_a, h_b] = L_res[h_a] · L_res[h_b] = e_{d+1} · e_{d+1} = 1  (for all h_a, h_b)
+  RR_AA[h_a, h_b] = R_res[h_a] · R_res[h_b] = e_{h_a} · e_{h_b} = δ_{h_a, h_b}
+  LR_AA[h_a, h_b] = L_res[h_a] · R_res[h_b] = e_{d+1} · e_{h_b} = 0  (since h_b < d)
+  RL_AA[h_a, h_b] = R_res[h_a] · L_res[h_b] = e_{h_a} · e_{d+1} = 0
+
+  Core_AA[h_a, h_b] = 0.5 * (1 * δ_{h_a,h_b} + 0 * 0) = 0.5 * δ_{h_a,h_b}
+
+  ||A||² = sum_{h_a, h_b} DD_AA[h_a,h_b] * 0.5 * δ_{h_a,h_b}
+         = 0.5 * sum_h DD_AA[h,h]
+         = 0.5 * sum_h sum_o W_res[o,h]²
+         = 0.5 * ||W_res||²_F
+
+  ┌─────────────────────────────────────────┐
+  │  ||A||² = 0.5 * ||W_res||²_F           │
+  │                                         │
+  │  The residual tensor norm is half the   │
+  │  Frobenius norm of the weight matrix!   │
+  │  The 0.5 comes from symmetrization.     │
+  └─────────────────────────────────────────┘
+
+
+4b. ||B||² = <B|B> (bilinear self-norm)
+----------------------------------------
+
+  L_a = L_b = L_bil, R_a = R_b = R_bil, D_a = D_b = D_bil
+
+  DD_BB = D_bil^T D_bil = D_eff^T D_eff     (rank × rank)
+  LL_BB = L_bil L_bil^T = L_eff L_eff^T     (rank × rank, zero-padded cols cancel)
+  RR_BB = R_bil R_bil^T = R_eff R_eff^T
+  LR_BB = L_bil R_bil^T = L_eff R_eff^T
+  RL_BB = R_bil L_bil^T = R_eff L_eff^T
+
+  Core_BB = 0.5 * (LL_BB * RR_BB + LR_BB * RL_BB)
+
+  ||B||² = sum(DD_BB * Core_BB)
+
+  This is just the standard TN self-norm of the bilinear part.
+
+
+4c. <A|B> = cross term (residual × bilinear)
+---------------------------------------------
+
+  L_a = L_res, R_a = R_res, D_a = D_res
+  L_b = L_bil, R_b = R_bil, D_b = D_bil
+
+  DD_AB[h_a, h_b] = (D_res^T D_bil)[h_a, h_b]
+                   = sum_o W_res[o, h_a] * D_eff[o, h_b]
+                   (784 × rank)
+
+  LL_AB[h_a, h_b] = L_res[h_a] · L_bil[h_b]
+                   = e_{d+1} · [L_eff[h_b, :], 0]
+                   = L_bil[h_b, d+1] = 0    (zero-padded)
+
+  LR_AB[h_a, h_b] = L_res[h_a] · R_bil[h_b]
+                   = e_{d+1} · [R_eff[h_b,:], 0] = 0
+
+  Since LL_AB = 0 and LR_AB = 0:
+
+  Core_AB[h_a, h_b] = 0.5 * (LL_AB*RR_AB + LR_AB*RL_AB) = 0
+
+  ┌─────────────────────────────────────────────────────┐
+  │  <A|B> = 0                                          │
+  │                                                     │
+  │  THE CROSS TERM VANISHES!                           │
+  │                                                     │
+  │  This is because L_res selects the constant dim     │
+  │  (d+1), but L_bil and R_bil are zero-padded there.  │
+  │  So LL_AB = LR_AB = 0, making Core_AB = 0.         │
+  └─────────────────────────────────────────────────────┘
+
+
+5. THE CLEAN DECOMPOSITION: PROJECTION FRACTIONS
+==================================================
+
+There are TWO ways to decompose ||T||². The first uses the specific
+orthogonality we proved above. The second is MORE GENERAL and more natural.
+
+
+5a. Pythagorean (specific to our case: A ⊥ B)
+-----------------------------------------------
+
+  ||T||² = ||A||² + ||B||²          [since <A|B> = 0]
+
+This works because the residual and bilinear are orthogonal in our
+augmented-input construction (disjoint index supports).
+
+
+5b. Projection decomposition (GENERAL — always works for any T = sum of parts)
+--------------------------------------------------------------------------------
+
+By linearity in the second argument of the inner product:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │  <T|T> = <T|A+B> = <T|A> + <T|B>                          │
+  │                                                             │
+  │  Define relative norms (projection fractions):              │
+  │    ρ(A) = <T|A> / <T|T>                                    │
+  │    ρ(B) = <T|B> / <T|T>                                    │
+  │                                                             │
+  │  Then: ρ(A) + ρ(B) = 1     EXACTLY, ALWAYS                │
+  │                                                             │
+  │  This is a proper partition of unity.                       │
+  │  No orthogonality assumption needed!                        │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+KEY PROPERTIES:
+
+  - This identity holds for ANY decomposition T = A + B, whether or not
+    A ⊥ B. It's just linearity of the inner product.
+
+  - SIGNED: ρ(A) can be negative or > 1. A negative value means that
+    component is actively cancelling the total norm — it points "against" T.
+    This gives meaningful signed contributions, not just magnitudes.
+
+  - EXTENDS TO N PARTS: if T = sum_k T_k, then sum_k ρ(T_k) = 1.
+    Every part gets a signed fraction that sums to 1.
+
+
+5c. Relationship between the two in the orthogonal case
+---------------------------------------------------------
+
+When <A|B> = 0 (as in our augmented-input case):
+  <T|A> = <A+B|A> = <A|A> + <B|A> = ||A||²
+  <T|B> = <A+B|B> = <A|B> + <B|B> = ||B||²
+
+So ρ(A) = ||A||²/||T||² and ρ(B) = ||B||²/||T||².
+The projection fractions EQUAL the Pythagorean fractions.
+Both are non-negative (since they equal self-norms / total norm).
+
+In the GENERAL case (non-orthogonal), ρ can be negative while ||·||² cannot.
+That's the power of the projection framing — it captures cancellation.
+
+
+5d. Contrast between the two decompositions
+---------------------------------------------
+
+  ||T||² = ||A||² + ||B||² + 2<A|B>    — self-norms + interference
+  ||T||² = <T|A> + <T|B>               — projections onto the whole
+
+The first tells you about self-norms and interference between parts.
+The second tells you how much each part *projects onto the whole*.
+
+The second is more natural for "what fraction of T is explained by A?"
+because it always sums to 1 and gives signed contributions.
+
+
+6. NUMERICAL PREDICTIONS
+==========================
+
+For the orthogonal case, TN-sim has a nice form:
+
+  TN-sim(A, T) = <A|T> / (||A|| * ||T||)
+               = ||A||² / (||A|| * ||T||)      [since <A|B> = 0]
+               = ||A|| / ||T||
+               = sqrt(ρ(A))
+
+  ┌──────────────────────────────────────────────────────────┐
+  │  TN-sim(residual, full)²  +  TN-sim(bilinear, full)²   │
+  │       = ρ(A) + ρ(B) = 1                                │
+  │                                                         │
+  │  Pythagorean identity in TN-sim space!                  │
+  │                                                         │
+  │  Our measured residual-only TN-sim ≈ 0.89               │
+  │  → ρ(A) ≈ 0.89² ≈ 0.79                                │
+  │  → ρ(B) ≈ 0.21                                         │
+  │  → predicted TN-sim(bilinear, full) ≈ sqrt(0.21) ≈ 0.46│
+  └──────────────────────────────────────────────────────────┘
+
+So about 79% of the tensor norm is the residual and 21% is the bilinear.
+
+
+7. FURTHER DECOMPOSITION INTO HIDDEN UNITS
+============================================
+
+Can we decompose B further? If B = sum_h B_h (one per hidden unit), the
+projection decomposition ALWAYS works:
+
+  sum_h <T|B_h> / <T|T> = <T|B> / <T|T> = ρ(B)
+
+So we can partition the bilinear fraction into per-hidden-unit contributions.
+These are signed — some hidden units may cancel others. The fractions always
+sum to ρ(B) exactly.
+
+Are B_h orthogonal to each other? In general, NO.
+
+  <B_h | B_h'> = DD_BB[h,h'] * Core_BB[h,h']
+
+This involves both:
+  - DD_BB[h,h'] = D_eff[:,h] · D_eff[:,h']  (output-space overlap)
+  - Core_BB[h,h'] = 0.5*(L_eff[h]·L_eff[h'] * R_eff[h]·R_eff[h'] + ...)
+                                                (input-space overlap)
+
+Both are generally nonzero, so individual hidden units are NOT orthogonal.
+But the projection fractions still sum correctly regardless.
+
+
+8. WHAT ABOUT RANK-1 APPROXIMATIONS?
+======================================
+
+For the frozen-residual + rank-1 approximation:
+  T_approx = A + b   (where b is rank-1 bilinear)
+
+Is <A|b> = 0? Yes! For the same reason <A|B> = 0:
+b uses L_bil-type rows (zero in dim d+1), so the cross core vanishes.
+
+  So: <T_approx | T> = ||A||² + <b|B>
+      ||T_approx||² = ||A||² + ||b||²   [A ⊥ b for same reason]
+
+  TN-sim = (||A||² + <b|B>) / (sqrt(||A||² + ||b||²) * ||T||)
+
+
+9. ON SYMMETRIZATION
+======================
+
+The Frobenius inner product is already symmetric: <A|B> = <B|A> always.
+Symmetrizing the tensors themselves (in the S_2 or S_4 sense) doesn't change
+any of the decomposition identities — the algebra holds regardless.
+
+What symmetrization DOES change is which CP/Tucker components are accessible,
+since you're working in the symmetric subspace. But the norm decomposition
+and projection fraction identities are unaffected.
+
+
+10. MULTI-LAYER GENERALIZATION
+===============================
+
+For 2-layer models, the decomposition is more complex. The residual is not
+simply additive in the degree-4 tensor because the second layer's bilinear
+operates on the first layer's output (which includes the residual).
+
+  f(x) = x + D₁@((L₁@x)⊙(R₁@x)) + D₂@((L₂@[x + bil₁(x)])⊙(R₂@[x + bil₁(x)]))
+
+The second layer sees x + bil₁(x), so its quadratic term creates degree-4
+interactions between the residual and bilinear parts. The clean orthogonality
+of the 1-layer case does NOT generalize to 2-layer.
+
+However, the projection decomposition (section 5b) still works for any
+T = sum of parts, regardless of structure. The fractions just won't
+necessarily be non-negative anymore.

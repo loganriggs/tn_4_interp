@@ -1,0 +1,328 @@
+================================================================================
+PARTIAL TENSOR SIMILARITY: OPTIMIZATION NOTES
+================================================================================
+
+1. ARCHITECTURE
+===============
+
+Full residual bilinear model for MNIST:
+  h = W_embed @ x                          (784 -> d_hidden)
+  h = h + D @ ((L @ h) ⊙ (R @ h))         bilinear + residual
+  logits = W_head @ h                      (d_hidden -> 10)
+
+For a 2-class slice (i,j), fold embed/head into effective weights:
+  L_eff = L @ W_embed          (rank, 784)
+  R_eff = R @ W_embed          (rank, 784)
+  D_eff = W_head[[i,j]] @ D    (2, rank)
+  W_res = W_head[[i,j]] @ W_embed   (2, 784)
+
+So the function is:
+  f(x) = W_res @ x + D_eff @ ((L_eff @ x) ⊙ (R_eff @ x))
+         ^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+         linear      bilinear (degree 2)
+
+
+2. AUGMENTED INPUT TRICK
+========================
+
+To tensorify the residual, augment x̂ = [x, 1] (dim 785):
+
+  x_i = 1 * x_i = (e_{785} · x̂)(e_i · x̂)
+
+This decomposes the linear part as a bilinear on x̂:
+  L_res[h, :] = e_{785}   (selects constant 1)     shape (784, 785)
+  R_res[h, :] = e_h       (selects x_h)            shape (784, 785)
+  D_res = W_res                                     shape (2, 784)
+
+Bilinear part gets zero-padded:
+  L_bil = [L_eff | 0]     shape (rank, 785)
+  R_bil = [R_eff | 0]     shape (rank, 785)
+
+Full augmented target:
+  L_aug = [L_res; L_bil]  shape (784+rank, 785)
+  R_aug = [R_res; R_bil]  shape (784+rank, 785)
+  D_aug = [D_res, D_bil]  shape (2, 784+rank)
+
+So f(x) = D_aug @ ((L_aug @ x̂) ⊙ (R_aug @ x̂))
+
+
+3. TN INNER PRODUCT FORMULA
+============================
+
+For two bilinear models with weights (L_a, R_a, D_a) and (L_b, R_b, D_b):
+
+  <T_a | T_b> = sum over hidden dims of DD * Core
+
+where:
+  LL = L_a @ L_b^T
+  RR = R_a @ R_b^T
+  LR = L_a @ R_b^T
+  RL = R_a @ L_b^T
+  Core = 0.5 * (LL * RR + LR * RL)     [S_2 symmetrization]
+  DD = D_a^T @ D_b
+
+  <T_a | T_b> = sum_{h_a, h_b} DD[h_a, h_b] * Core[h_a, h_b]
+
+This is the FROBENIUS inner product of the symmetrized degree-2 tensors,
+NOT the function-space inner product E_x[f(x)·g(x)].
+
+
+4. SYMMETRIZATION
+=================
+
+The S_2 symmetrization accounts for L↔R exchange symmetry:
+  T_symmetrized[i, j, k] = 0.5 * (T[i,j,k] + T[i,k,j])
+
+In the Core formula: 0.5 * (LL*RR + LR*RL)
+  - LL*RR = same pairing (L↔L, R↔R)
+  - LR*RL = swapped pairing (L↔R, R↔L)
+
+For the augmented weights, L_res ≠ R_res (L selects constant, R selects x_h),
+so the symmetrization is important — it's NOT the symmetric (L=R) case.
+
+For 2-layer, the full S_4 symmetrization has 24 permutations (see
+mnist_pairwise_tnsim.py:tn_inner_2layer).
+
+
+5. CURRENT OPTIMIZATION APPROACHES
+====================================
+
+Approach A: Free rank-1 in augmented space (current "run_residual.py")
+------------------------------------------------------------------------
+  Approximation: l (1, 785), r (1, 785), d (n_out, 1)
+  All three are freely optimized.
+
+  TN-sim = <l⊗r⊗d | L_aug⊗R_aug⊗D_aug> / (norms)
+
+  Problem: the rank-1 has to capture both the residual (784 hidden units)
+  AND the bilinear (rank hidden units). Since residual dominates the tensor
+  norm, the rank-1 mostly learns the linear part.
+
+  Result: ~0.73 mean TN-sim, but poor behavioral correlation for some classes.
+
+Approach B: Frozen residual + rank-1 (current "run_frozen_residual.py")
+------------------------------------------------------------------------
+  Approximation:
+    L_approx = [L_res; l]     (785, 785) = frozen 784 + trainable 1
+    R_approx = [R_res; r]     (785, 785)
+    D_approx = [D_res, d]     (n_out, 785)
+
+  Only l, r, d are optimized. L_res, R_res, D_res are frozen (exact residual).
+
+  TN-sim = <approx | target> / (norms)
+
+  Residual-only baseline (l=r=d=0): ~0.89 mean TN-sim
+  After optimization: should go higher, measuring bilinear correction quality.
+
+  Problem: VERY expensive. The Gram matrices are (785, 784+rank) per batch
+  element. With batch=225, the bmm is (225, 785, 785) x (225, 785, 816).
+  ~14GB VRAM, ~10-15 min for 1000 steps.
+
+
+6. POTENTIAL OPTIMIZATION: EXPLOITING RESIDUAL STRUCTURE
+=========================================================
+
+The frozen residual has known structure. When computing the TN inner product
+between the approximation and target, we can decompose:
+
+  L_approx = [L_res; l]    (785 = 784 + 1 rows)
+  R_approx = [R_res; r]
+  D_approx = [D_res, d]    (785 = 784 + 1 cols)
+
+The Gram matrices decompose into blocks:
+
+  L_approx @ L_target^T = [L_res @ L_target^T;  l @ L_target^T]
+                            ^^^^^^^^^^^^^^^^     ^^^^^^^^^^^^^^^
+                            (784, 816) FROZEN    (1, 816) trainable
+
+Similarly for RR, LR, RL.
+
+Core = 0.5 * (LL * RR + LR * RL) is (785, 816), but decomposes into:
+  - (784, 816) block from residual×target interactions [FROZEN, precompute once]
+  - (1, 816) block from rank1×target interactions [recompute each step]
+  - Cross blocks need care
+
+DD = D_approx^T @ D_target decomposes as:
+  DD = [D_res^T; d^T] @ D_target = [D_res^T @ D_target; d^T @ D_target]
+       (785, 816) = (784, 816) frozen + (1, 816) trainable
+
+So the full inner product:
+  <approx | target> = sum(DD * Core)
+
+  = sum(DD_frozen * Core_frozen)        [PRECOMPUTE ONCE - scalar]
+  + sum(DD_frozen * Core_rank1_rows)    [rank1×target, weighted by frozen D]
+  + sum(DD_rank1 * Core_frozen_rows)    [frozen×target, weighted by rank1 D]
+  + sum(DD_rank1 * Core_rank1_rows)     [pure rank1 term - tiny]
+
+For the frozen part of the Core:
+  LL_frozen = L_res @ L_target^T     (784, 816) — precompute
+  RR_frozen = R_res @ R_target^T     (784, 816)
+  LR_frozen = L_res @ R_target^T     (784, 816)
+  RL_frozen = R_res @ L_target^T     (784, 816)
+  Core_frozen = 0.5*(LL_frozen*RR_frozen + LR_frozen*RL_frozen)  (784, 816)
+
+For the rank1×target part:
+  LL_r1 = l @ L_target^T     (1, 816) — recompute each step
+  RR_r1 = r @ R_target^T     (1, 816)
+  etc.
+
+For the CROSS terms (residual-row × rank1-col and vice versa):
+  When computing Core[i, j] for i in residual rows and the rank1 contributes
+  through the other factor... this is where it gets tricky.
+
+  Actually, Core[h_a, h_b] = 0.5*(LL[h_a,h_b]*RR[h_a,h_b] + LR[h_a,h_b]*RL[h_a,h_b])
+
+  The h_a index runs over the approximation's hidden dim (785 = 784 + 1).
+  For h_a in [0, 784): these are residual rows.
+    LL[h_a, :] = L_res[h_a] @ L_target^T  — FROZEN
+    RR[h_a, :] = R_res[h_a] @ R_target^T  — FROZEN
+    Core[h_a, :] is FROZEN for these rows.
+
+  For h_a = 784: this is the rank-1 row.
+    LL[784, :] = l @ L_target^T  — trainable
+    RR[784, :] = r @ R_target^T  — trainable
+    Core[784, :] = 0.5*(LL_r1*RR_r1 + LR_r1*RL_r1)
+
+  So Core has 784 frozen rows + 1 trainable row. Similarly DD has 784 frozen
+  rows + 1 trainable row.
+
+  <approx | target> = sum_{h_a} sum_{h_b} DD[h_a, h_b] * Core[h_a, h_b]
+
+  = sum_{h_a < 784} DD_frozen[h_a, :] · Core_frozen[h_a, :]   [PRECOMPUTE]
+  + DD_rank1[0, :] · Core_rank1[0, :]                          [small, cheap]
+
+  WHERE:
+  DD_frozen[h_a, :] = D_res[:, h_a]^T @ D_target             (816,)
+  DD_rank1[0, :] = d^T @ D_target                             (816,)
+  Core_frozen[h_a, :] = 0.5*(LL_f*RR_f + LR_f*RL_f)[h_a, :]  (816,)
+  Core_rank1[0, :] = 0.5*((l@Lt)(r@Rt) + (l@Rt)(r@Lt))       (816,)
+
+  WAIT — this is actually clean!
+
+  The key insight: because L_approx and R_approx are block-structured
+  (784 frozen rows + 1 trainable row), and D_approx is block-structured
+  (784 frozen cols + 1 trainable col), the ENTIRE inner product decomposes as:
+
+  <approx | target> = C_frozen + f(l, r, d)
+
+  where C_frozen is a precomputed scalar and f(l, r, d) only involves:
+  - l @ L_target^T  (1, 816)
+  - r @ R_target^T  (1, 816)
+  - l @ R_target^T  (1, 816)
+  - r @ L_target^T  (1, 816)
+  - d^T @ D_target   (1, 816)
+  - DD_frozen_sum = sum over h_a of D_res[:,h_a]^T @ D_target * Core_frozen[h_a,:]
+    This is a (816,) vector, PRECOMPUTED.
+
+  Then:
+  f(l, r, d) = (d^T @ D_target) · Core_rank1   [rank1 D, rank1 Core]
+             + DD_frozen_sum · Core_rank1        [frozen D, rank1 Core]
+
+  Hmm wait, let me redo this more carefully...
+
+  Actually: DD[h_a, h_b] is NOT row-separable in a simple way because
+  DD = D_approx^T @ D_target where D_approx has 785 columns, so
+  DD is (785, 816). DD[h_a, :] = D_approx[:, h_a]^T @ D_target.
+
+  For h_a < 784: DD[h_a, :] = D_res[:, h_a] · D_target  — this is frozen
+  For h_a = 784: DD[784, :] = d[:, 0] · D_target          — trainable
+
+  And Core[h_a, :] for h_a < 784 is frozen, for h_a = 784 is trainable.
+
+  So:
+  <approx | target> = sum_{h_a=0}^{783} (DD_f[h_a,:] * Core_f[h_a,:]).sum()
+                     + (DD_r1 * Core_r1).sum()
+
+  = PRECOMPUTED_SCALAR + (d^T @ D_target) · 0.5*((l@Lt)(r@Rt) + (l@Rt)(r@Lt))
+
+  THIS IS JUST A SCALAR DOT PRODUCT! The expensive part is precomputed once.
+
+  For the self-inner-product <approx | approx>, similar decomposition applies
+  but has more cross terms since both sides have the block structure.
+
+
+7. EFFICIENT IMPLEMENTATION (TODO)
+====================================
+
+Precompute once per target:
+  C_frozen = <residual_only | target>              scalar
+  C_self_frozen = <residual_only | residual_only>  scalar
+
+  # For rank1 × target cross term:
+  Lt = L_target    (816, 785)  — store
+  Rt = R_target    (816, 785)
+  DD_target = D_target         (n_out, 816)
+
+  # For rank1 × residual cross term in self-norm:
+  Core_frozen_res_res = precomputed (784, 784) — but this is huge
+
+  Actually for the self-norm, the cross terms between residual and rank1 are:
+  sum_{h_a < 784} DD_cross[h_a, 784] * Core_cross[h_a, 784]
+
+  This requires DD[h_a, 784] = D_res[:,h_a]^T @ d  and
+  Core[h_a, 784] = 0.5*(L_res[h_a]@l^T * R_res[h_a]@r^T + ...)
+
+  Since L_res[h_a] = e_{785} for all h_a, L_res[h_a] @ l^T = l[0, 784] (scalar!)
+  And R_res[h_a] = e_h, so R_res[h_a] @ r^T = r[0, h_a]
+
+  So LL_cross[h_a] = l[784]  (same for all h_a)
+  RR_cross[h_a] = r[h_a]
+  LR_cross[h_a] = l[h_a]  (wait... L_res[h_a] @ r^T = r[0, 784] since L_res selects dim 784)
+
+  Hmm, need to be more careful. L_res[h_a, :] = e_{785}, so:
+    L_res[h_a] @ l^T = l[0, 784]         (the constant-dim component of l)
+    L_res[h_a] @ r^T = r[0, 784]
+    R_res[h_a] @ l^T = l[0, h_a]         (R_res selects x_{h_a})
+    R_res[h_a] @ r^T = r[0, h_a]
+
+  So for residual-row h_a, rank1-row 784:
+    LL[h_a, 784] = L_res[h_a] @ l^T = l[784]
+    RR[h_a, 784] = R_res[h_a] @ r^T = r[h_a]
+    LR[h_a, 784] = L_res[h_a] @ r^T = r[784]
+    RL[h_a, 784] = R_res[h_a] @ l^T = l[h_a]
+
+    Core[h_a, 784] = 0.5*(l[784]*r[h_a] + r[784]*l[h_a])
+
+  And DD[h_a, 784] = D_res[:, h_a]^T @ d[:, 0]
+
+  So the cross term in self-norm:
+    2 * sum_{h_a} DD[h_a, 784] * Core[h_a, 784]
+    = 2 * sum_{h_a} (D_res[:,h_a]·d[:,0]) * 0.5*(l[784]*r[h_a] + r[784]*l[h_a])
+    = sum_{h_a} (D_res[:,h_a]·d[:,0]) * (l[784]*r[h_a] + r[784]*l[h_a])
+
+  This is a dot product of (784,) vectors — cheap!
+
+  So the full self-norm decomposes as:
+    <approx | approx> = C_self_frozen
+                       + 2 * cross_term(l, r, d)    [the above]
+                       + <rank1 | rank1>             [tiny, scalar]
+
+  And the cross-inner:
+    <approx | target> = C_frozen + rank1_target_term(l, r, d)
+
+  CONCLUSION: For 1-layer, the frozen residual structure can be fully
+  exploited. Each optimization step only needs (1, 785) × (816, 785)
+  matmuls plus some dot products — NOT the full (785, 785) × (785, 816) bmm.
+
+  This would reduce VRAM from ~15GB to < 1GB and speed up ~100x.
+
+  For 2-layer: the augmented layer 1 feeds into layer 2, so the frozen
+  structure propagates through the 4th-order tensor contractions. The S_4
+  symmetrization makes the decomposition messier but still possible in
+  principle — you'd precompute all frozen×frozen contractions and only
+  recompute terms involving the trainable rank-1 component.
+
+
+8. MATRIOSHKA / JOINT OPTIMIZATION (FUTURE)
+=============================================
+
+Idea: jointly optimize multiple rank-1 components:
+  - Rank-1 for class i
+  - Rank-1 for class j
+  - Rank-1 for pair (i,j)
+
+These could share structure or be regularized to be orthogonal.
+Similar to Matrioshka SAE: nested representations at different granularities.
+
+Could also do greedy rank building: optimize rank-1, freeze it, optimize
+rank-2 correction, etc. The frozen-residual approach naturally extends to this.
