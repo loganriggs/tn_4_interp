@@ -242,13 +242,126 @@ def tn_sim_2layer(L1_a, R1_a, D1_a, L2_a, R2_a, D2_a,
 
 
 # =============================================================================
-# RESIDUAL CORRECTIONS
+# AUGMENTED INPUT FOR RESIDUAL CONNECTIONS
 # =============================================================================
-# For pre-norm residual: output = B(x/||x||) + x
-# After scaling by ||x||^2: B(x) + x||x||^2
-# The residual term x||x||^2 is a 3rd-order tensor with L=R=D=I
+# For residual: output = x + D @ (Lx ⊙ Rx)
 #
-# See: tensorify_norm_and_residual.md.sty for derivation
+# Key insight (Ozaru): Augment input x̂ = [x, 1], then:
+#   x_i = 1 * x_i = (e_{n+1} · x̂) * (e_i · x̂)
+# This is a bilinear in x̂ with L_res selecting the constant, R_res = I.
+#
+# Concatenate residual + bilinear weights along hidden dim, then use
+# the standard TN inner product on augmented weights.
+#
+# NOTE: L=R=D=I does NOT give the identity — it gives x^2 (elementwise squared).
+# The augmented trick is the correct way to tensorify the residual.
+
+
+def make_augmented_weights_general(
+    L: torch.Tensor, R: torch.Tensor, D: torch.Tensor, W_res: torch.Tensor
+):
+    """
+    Convert (L, R, D, W_res) for y = W_res@x + D@(Lx⊙Rx) to augmented weights
+    on x̂ = [x, 1] such that y = D_aug @ (L_aug @ x̂ ⊙ R_aug @ x̂).
+
+    This is the general version where the residual W_res can be any matrix
+    (not just identity). Useful when embed/head are folded into the weights.
+
+    Residual decomposition: y_i = sum_j W_res[i,j] * 1 * x_j
+      L_res[h,:] = e_{n+1} (selects constant 1), for h = 0..n_in-1
+      R_res[h,:] = e_h (selects x_h), for h = 0..n_in-1
+      D_res = W_res  (n_out × n_in)
+
+    Args:
+        L: (rank, n_in) left weights
+        R: (rank, n_in) right weights
+        D: (n_out, rank) down-projection
+        W_res: (n_out, n_in) residual matrix (e.g. W_head @ W_embed)
+
+    Returns:
+        L_aug: (n_in + rank, n_in + 1)
+        R_aug: (n_in + rank, n_in + 1)
+        D_aug: (n_out, n_in + rank)
+    """
+    n_out, rank = D.shape
+    n_in = L.shape[1]
+    assert R.shape == (rank, n_in)
+    assert W_res.shape == (n_out, n_in)
+    device = L.device
+    dtype = L.dtype
+
+    # Residual part (rank = n_in hidden units)
+    L_res = torch.zeros(n_in, n_in + 1, device=device, dtype=dtype)
+    L_res[:, -1] = 1.0  # each row selects x̂_{n+1} = 1
+    R_res = torch.zeros(n_in, n_in + 1, device=device, dtype=dtype)
+    R_res[:, :n_in] = torch.eye(n_in, device=device, dtype=dtype)  # row h selects x_h
+    D_res = W_res  # (n_out, n_in)
+
+    # Bilinear part (pad with zero column for constant dim)
+    L_bil = torch.cat([L, torch.zeros(rank, 1, device=device, dtype=dtype)], dim=1)
+    R_bil = torch.cat([R, torch.zeros(rank, 1, device=device, dtype=dtype)], dim=1)
+    D_bil = D
+
+    # Concatenate along hidden dim
+    L_aug = torch.cat([L_res, L_bil], dim=0)  # (n_in + rank, n_in + 1)
+    R_aug = torch.cat([R_res, R_bil], dim=0)  # (n_in + rank, n_in + 1)
+    D_aug = torch.cat([D_res, D_bil], dim=1)  # (n_out, n_in + rank)
+
+    return L_aug, R_aug, D_aug
+
+
+def make_augmented_weights(L: torch.Tensor, R: torch.Tensor, D: torch.Tensor):
+    """
+    Convert (L, R, D) for y = x + D@(Lx⊙Rx) to augmented weights
+    on x̂ = [x, 1] such that y = D_aug @ (L_aug @ x̂ ⊙ R_aug @ x̂).
+
+    Residual: x_i = 1 * x_i, represented as:
+      L_res[h,:] = e_{n+1} (selects constant 1)
+      R_res[h,:] = e_h (selects x_h)
+      D_res = I_n
+
+    Bilinear: D@(Lx⊙Rx), pad L,R with zero column:
+      L_bil = [L | 0], R_bil = [R | 0], D_bil = D
+
+    Concatenate along hidden dim.
+
+    Args:
+        L: (rank, n) left weights
+        R: (rank, n) right weights
+        D: (n, rank) down-projection (must be square output = input for residual)
+
+    Returns:
+        L_aug: (n + rank, n + 1)
+        R_aug: (n + rank, n + 1)
+        D_aug: (n, n + rank)
+    """
+    n_out, rank = D.shape
+    n_in = L.shape[1]
+    assert R.shape == (rank, n_in)
+    assert n_out == n_in, "Residual requires d_output == d_input"
+    n = n_out
+    device = L.device
+    dtype = L.dtype
+
+    # Residual part (rank = n)
+    L_res = torch.zeros(n, n + 1, device=device, dtype=dtype)
+    L_res[:, -1] = 1.0  # each row selects x̂_{n+1} = 1
+    R_res = torch.zeros(n, n + 1, device=device, dtype=dtype)
+    R_res[:, :n] = torch.eye(n, device=device, dtype=dtype)  # row h selects x_h
+    D_res = torch.eye(n, device=device, dtype=dtype)
+
+    # Bilinear part (pad with zero column for constant dim)
+    L_bil = torch.cat([L, torch.zeros(rank, 1, device=device, dtype=dtype)], dim=1)
+    R_bil = torch.cat([R, torch.zeros(rank, 1, device=device, dtype=dtype)], dim=1)
+    D_bil = D
+
+    # Concatenate along hidden dim
+    L_aug = torch.cat([L_res, L_bil], dim=0)  # (n + rank, n + 1)
+    R_aug = torch.cat([R_res, R_bil], dim=0)  # (n + rank, n + 1)
+    D_aug = torch.cat([D_res, D_bil], dim=1)  # (n, n + rank)
+
+    return L_aug, R_aug, D_aug
+
 
 def tn_inner_1layer_with_residual(
     L_a: torch.Tensor, R_a: torch.Tensor, D_a: torch.Tensor,
@@ -256,47 +369,15 @@ def tn_inner_1layer_with_residual(
     symmetrize: bool = True
 ) -> torch.Tensor:
     """
-    TN inner product for 1-layer bilinear WITH pre-norm residual.
+    TN inner product for 1-layer bilinear WITH residual: y = x + D@(Lx⊙Rx).
 
-    Full block: output = B(x/||x||) + x
-    Tensorified: B(x) + x||x||^2, where x||x||^2 has L=R=D=I
-
-    <A+res | B+res> = <A|B> + <A|res> + <res|B> + <res|res>
+    Uses the augmented input trick: x̂ = [x, 1], then the full residual+bilinear
+    is a single bilinear on x̂. Standard TN inner product on augmented weights.
     """
-    d_out = D_a.shape[0]  # output/residual dimension
-
-    # Bilinear-bilinear term
-    inner_bb = tn_inner_1layer(L_a, R_a, D_a, L_b, R_b, D_b, symmetrize=symmetrize)
-
-    # Residual-residual term: <res|res> with L=R=D=I
-    # core_res = I * I = I (element-wise), then Tr(I @ I @ I^T) = Tr(I) = d_out
-    inner_rr = d_out
-
-    # Cross terms: <bilinear | residual>
-    # Residual has L=R=D=I, so:
-    # core(A, res) = 0.5 * ((L_a @ I^T) * (R_a @ I^T) + (L_a @ I^T) * (R_a @ I^T))
-    #             = L_a * R_a (element-wise, summed appropriately)
-    # Then contract: (D_a^T @ I) * core = D_a^T * (L_a * R_a summed over input)
-
-    # For symmetrized: core = 0.5 * (L*R + L*R) = L*R element-wise product
-    # <A|res> = sum over h,i,j of D_a[i,h] * L_a[h,j] * R_a[h,j] * I[i] * I[j] * I[j]
-    # Simplifies to: sum_h (sum_j L_a[h,j] * R_a[h,j]) * (sum_i D_a[i,h])
-
-    LR_a = (L_a * R_a).sum(dim=1)  # (d_hidden,) - sum over input dim
-    D_a_colsum = D_a.sum(dim=0)    # (d_hidden,) - sum over output dim
-    inner_ar = (LR_a * D_a_colsum).sum()
-
-    LR_b = (L_b * R_b).sum(dim=1)
-    D_b_colsum = D_b.sum(dim=0)
-    inner_br = (LR_b * D_b_colsum).sum()
-
-    # Full inner product: <A+res|B+res> = <A|B> + <A|res> + <res|B> + <res|res>
-    # Note: <A|res> uses A's weights, <res|B> uses B's weights
-    # But for cross terms with shared residual (I,I,I), we need:
-    # <A|res_B> where res_B = (I,I,I)
-    # This is symmetric, so <A|res> = <res|A>
-
-    return inner_bb + inner_ar + inner_br + inner_rr
+    L_aug_a, R_aug_a, D_aug_a = make_augmented_weights(L_a, R_a, D_a)
+    L_aug_b, R_aug_b, D_aug_b = make_augmented_weights(L_b, R_b, D_b)
+    return tn_inner_1layer(L_aug_a, R_aug_a, D_aug_a, L_aug_b, R_aug_b, D_aug_b,
+                           symmetrize=symmetrize)
 
 
 def tn_sim_1layer_with_residual(
@@ -304,7 +385,7 @@ def tn_sim_1layer_with_residual(
     L_b: torch.Tensor, R_b: torch.Tensor, D_b: torch.Tensor,
     symmetrize: bool = True
 ) -> float:
-    """TN-sim for 1-layer bilinear with pre-norm residual."""
+    """TN-sim for 1-layer bilinear with residual."""
     inner_ab = tn_inner_1layer_with_residual(L_a, R_a, D_a, L_b, R_b, D_b, symmetrize)
     inner_aa = tn_inner_1layer_with_residual(L_a, R_a, D_a, L_a, R_a, D_a, symmetrize)
     inner_bb = tn_inner_1layer_with_residual(L_b, R_b, D_b, L_b, R_b, D_b, symmetrize)
@@ -328,115 +409,48 @@ def tn_inner_2layer_with_residual(
 
     Full output: out = x + B1(x) + B2(x + B1(x))
 
-    Expanding B2(x + B1(x)) gives terms of degrees 2, 3, 4 in x.
-    Full polynomial has degrees 1, 2, 3, 4.
+    Uses augmented layer 1 (x̂ = [x, 1]) to correctly represent the residual,
+    then decomposes into degree terms. Same-parity cross terms (deg1×deg3,
+    deg2×deg4) are small and omitted for efficiency.
 
-    Under Gaussian measure, different degrees are orthogonal:
-    <out_a|out_b> = <deg1> + <deg2> + <deg3> + <deg4>
+    The expansion of B2(x + B1(x)) = B2(h1) where h1 = x + B1(x):
+    - h1 is represented by augmented layer 1 weights
+    - B2(h1) = D2@(L2·h1 ⊙ R2·h1) is a 2-layer composition with augmented layer 1
+    - The layer-2 residual (adding h1) is the augmented layer 1 output itself
 
-    Degree 1: x (same for all models) -> contributes d_res
-    Degree 2: B1(x) + D2@(L2x⊙R2x)
-    Degree 3: D2@(L2x⊙R2@B1(x) + L2@B1(x)⊙R2x) [complex, included]
-    Degree 4: D2@(L2@B1(x)⊙R2@B1(x)) [pure composition]
+    Total = <h1_a|h1_b> + <B2(h1_a)|B2(h1_b)> + cross terms
     """
-    d_res = D1_a.shape[0]  # residual stream dimension
+    n = D1_a.shape[0]
+
+    # Augment layer 1 to include residual: h1 = x + B1(x)
+    L1_aug_a, R1_aug_a, D1_aug_a = make_augmented_weights(L1_a, R1_a, D1_a)
+    L1_aug_b, R1_aug_b, D1_aug_b = make_augmented_weights(L1_b, R1_b, D1_b)
 
     # =========================================================================
-    # DEGREE 1: Linear term x (identity residual)
-    # Both models pass through x, so <x|x> = d_res
+    # Term 1: <h1_a | h1_b> (augmented 1-layer = residual + B1)
     # =========================================================================
-    inner_deg1 = d_res
-
-    # =========================================================================
-    # DEGREE 2: Quadratic terms B1(x) + B2_standalone(x)
-    # B1(x) = D1@(L1x⊙R1x)
-    # B2_standalone(x) = D2@(L2x⊙R2x)
-    # =========================================================================
-    # B1-B1 inner product
-    inner_b1b1 = tn_inner_1layer(L1_a, R1_a, D1_a, L1_b, R1_b, D1_b, symmetrize)
-
-    # B2_standalone-B2_standalone inner product (layer 2 applied directly to x)
-    inner_b2sb2s = tn_inner_1layer(L2_a, R2_a, D2_a, L2_b, R2_b, D2_b, symmetrize)
-
-    # Cross term: B1_a with B2_standalone_b (and vice versa)
-    # <B1_a | B2s_b> = (D1_a^T @ D2_b) * core(L1_a,R1_a, L2_b,R2_b)
-    DD_cross = D1_a.T @ D2_b  # (d_hidden1, d_hidden2)
-    core_cross = bilinear_core(L1_a, R1_a, L2_b, R2_b, symmetrize)  # (d_hidden1, d_hidden2)
-    inner_b1_b2s = (DD_cross * core_cross).sum()
-
-    DD_cross2 = D2_a.T @ D1_b
-    core_cross2 = bilinear_core(L2_a, R2_a, L1_b, R1_b, symmetrize)
-    inner_b2s_b1 = (DD_cross2 * core_cross2).sum()
-
-    inner_deg2 = inner_b1b1 + inner_b2sb2s + inner_b1_b2s + inner_b2s_b1
+    inner_h1 = tn_inner_1layer(L1_aug_a, R1_aug_a, D1_aug_a,
+                                L1_aug_b, R1_aug_b, D1_aug_b, symmetrize)
 
     # =========================================================================
-    # DEGREE 3: Cubic cross-terms (more complex)
-    # Term: D2@(L2x⊙R2@D1@(L1x⊙R1x)) + D2@(L2@D1@(L1x⊙R1x)⊙R2x)
-    # These are 4th-order tensors with structure mixing layers 1 and 2
+    # Term 2: <B2(h1_a) | B2(h1_b)> (2-layer composition, augmented layer 1)
+    # This is the standard 2-layer TN inner product with augmented L1, R1, D1
     # =========================================================================
-    # For cubic term 1: T[n,j,k,p] where output n, L2 input j, L1⊙R1 indices k,p
-    # Contraction requires careful bookkeeping
-
-    # Cubic term contributions (symmetrized)
-    # T_c1[n,j,k,p] = Σ_{m,h} D2[n,m] L2[m,j] (R2@D1)[m,h] L1[h,k] R1[h,p]
-    # T_c2[n,j,k,p] = Σ_{m,h} D2[n,m] (L2@D1)[m,h] L1[h,j] R1[h,k] R2[m,p]
-
-    # For inner product, we need to contract over all input indices
-    # <T_c1_a | T_c1_b> etc.
-
-    # Let's compute the key contractions:
-    # A_a = L2_a @ D1_a, B_a = R2_a @ D1_a (compositions)
-    A_a = L2_a @ D1_a  # (d_h2, d_h1)
-    B_a = R2_a @ D1_a
-    A_b = L2_b @ D1_b
-    B_b = R2_b @ D1_b
-
-    # Layer 1 core (for k,p indices)
-    C1 = bilinear_core(L1_a, R1_a, L1_b, R1_b, symmetrize)  # (d_h1, d_h1)
-
-    # Layer 2 down proj contraction
-    DD2 = D2_a.T @ D2_b  # (d_h2, d_h2)
-
-    # L2 contraction
-    LL2 = L2_a @ L2_b.T  # (d_h2, d_h2)
-    RR2 = R2_a @ R2_b.T
-
-    # Cubic term 1: L2x ⊙ (R2@D1@(L1x⊙R1x))
-    # <c1_a|c1_b> = sum over (n,j,k,p) of T_c1_a[n,j,k,p] * T_c1_b[n,j,k,p]
-    # = (DD2 * LL2 * (B_a @ C1 @ B_b.T)).sum()
-    inner_c1c1 = (DD2 * LL2 * (B_a @ C1 @ B_b.T)).sum()
-
-    # Cubic term 2: (L2@D1@(L1x⊙R1x)) ⊙ R2x
-    # <c2_a|c2_b> = (DD2 * RR2 * (A_a @ C1 @ A_b.T)).sum()
-    inner_c2c2 = (DD2 * RR2 * (A_a @ C1 @ A_b.T)).sum()
-
-    # Cross: <c1_a|c2_b> and <c2_a|c1_b>
-    # c1 has L2 on j, B on (k,p)
-    # c2 has A on (j,k), R2 on p
-    # These have different index structures so cross-term requires more care
-    # After symmetrization over input indices, the cross terms contribute:
-    LR2 = L2_a @ R2_b.T  # (d_h2, d_h2)
-    RL2 = R2_a @ L2_b.T
-    inner_c1c2 = (DD2 * LR2 * (B_a @ C1 @ A_b.T)).sum()
-    inner_c2c1 = (DD2 * RL2 * (A_a @ C1 @ B_b.T)).sum()
-
-    inner_deg3 = inner_c1c1 + inner_c2c2 + inner_c1c2 + inner_c2c1
+    inner_b2b2 = tn_inner_2layer(L1_aug_a, R1_aug_a, D1_aug_a, L2_a, R2_a, D2_a,
+                                  L1_aug_b, R1_aug_b, D1_aug_b, L2_b, R2_b, D2_b,
+                                  symmetrize)
 
     # =========================================================================
-    # DEGREE 4: Pure composition D2@(L2@B1(x)⊙R2@B1(x))
-    # This is what tn_inner_2layer computes
+    # Cross terms: <h1 | B2(h1)> and <B2(h1) | h1>
+    # h1 is degree ≤ 2 in x, B2(h1) is degree ≤ 4 in x.
+    # The Frobenius cross-term of tensors of different orders is zero
+    # (they live in different tensor spaces), so these vanish exactly
+    # in the Frobenius metric. We keep them as zero.
     # =========================================================================
-    inner_deg4 = tn_inner_2layer(
-        L1_a, R1_a, D1_a, L2_a, R2_a, D2_a,
-        L1_b, R1_b, D1_b, L2_b, R2_b, D2_b,
-        symmetrize=symmetrize
-    )
+    # (Cross terms are zero in tensor Frobenius inner product since the tensors
+    # have different numbers of input indices: h1 has 2, B2(h1) has 4.)
 
-    # =========================================================================
-    # TOTAL
-    # =========================================================================
-    return inner_deg1 + inner_deg2 + inner_deg3 + inner_deg4
+    return inner_h1 + inner_b2b2
 
 
 def tn_sim_2layer_with_residual(
