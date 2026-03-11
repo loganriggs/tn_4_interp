@@ -1,0 +1,291 @@
+================================================================================
+BOOLEAN LOGIC GATE BENCHMARK FOR TN-SIM FEATURE DISENTANGLING
+================================================================================
+
+GOAL
+====
+Build a synthetic benchmark where:
+  1. Ground truth features are KNOWN (we design the logic)
+  2. Classes are MUTUALLY EXCLUSIVE (one class active at a time, like MNIST)
+  3. Classes share intermediate features in known ways
+  4. We use TN-sim / relative norms / rank-1 optimization to DISENTANGLE
+     the shared features and verify recovery against ground truth
+
+The main question: can we recover shared intermediate features from the
+learned weights using TN-sim-based methods?
+
+
+CORE DESIGN PRINCIPLE
+=====================
+
+Define FEATURES first, then CLASSES as unique combinations of features.
+
+Example:
+  Feature A = x0 AND x1    (degree 2)
+  Feature B = x2 AND x3    (degree 2)
+
+  Class 0: A=0, B=0   (neither feature active)
+  Class 1: A=1, B=0   (only A active)
+  Class 2: A=0, B=1   (only B active)
+  Class 3: A=1, B=1   (both active)
+
+This is a PROPER PARTITION of {0,1}^4 — every input maps to exactly one
+class. And the classes share features: classes 1,3 both "use" feature A,
+classes 2,3 both "use" feature B.
+
+The model must learn intermediate representations of A and B to classify
+correctly. TN-sim should be able to recover these shared features.
+
+
+WHY BILINEAR IS PERFECT FOR THIS
+=================================
+
+  AND(x_i, x_j) = x_i * x_j
+
+This is EXACTLY a rank-1 term in the bilinear part:
+  l = e_i, r = e_j, d = [weight]
+
+So each AND feature is a single rank-1 component. The model's job is to
+compose these features to classify. TN-sim's job is to decompose them back.
+
+For the residual stream: individual bits x_i are degree-1 (linear).
+For bilinear: AND gates are degree-2.
+For 2-layer: AND-of-ANDs is degree-4.
+
+Different classes naturally involve different polynomial degrees.
+
+
+LEVEL 1: Two AND features, 4 classes (1-layer, n=4)
+=====================================================
+
+  Input: x ∈ {0,1}^4
+  Features:
+    A = x0 AND x1
+    B = x2 AND x3
+
+  Classes (partition of {0,1}^4):
+    class 0: A=0, B=0   (9 inputs: neither pair both 1)
+    class 1: A=1, B=0   (3 inputs: x0=x1=1, not both x2=x3=1)
+    class 2: A=0, B=1   (3 inputs: x2=x3=1, not both x0=x1=1)
+    class 3: A=1, B=1   (1 input: all ones)
+
+  What we expect:
+    - ρ(bilinear) >> ρ(residual) for all classes (task is degree-2)
+    - Rank-1 TN-sim for class 1 should recover l∝e_0, r∝e_1 (feature A)
+    - Rank-1 TN-sim for class 2 should recover l∝e_2, r∝e_3 (feature B)
+    - Class 3 needs BOTH features → rank-1 won't suffice, need rank-2
+    - Class 0 is "default" — NOT(A) AND NOT(B) = 1 - A - B + AB
+
+  Feature sharing:
+    - TN-sim(class1, class3) should be high (both use feature A)
+    - TN-sim(class2, class3) should be high (both use feature B)
+    - TN-sim(class1, class2) should be low (disjoint features)
+
+  Class imbalance: 9:3:3:1 — realistic (like rare digit combos in MNIST)
+
+
+LEVEL 2: Three AND features, richer sharing (1-layer, n=6)
+============================================================
+
+  Input: x ∈ {0,1}^6
+  Features:
+    A = x0 AND x1
+    B = x2 AND x3
+    C = x4 AND x5
+
+  Classes (8 classes = 2^3 feature combinations):
+    class 0: A=0, B=0, C=0   (none active)
+    class 1: A=1, B=0, C=0   (only A)
+    class 2: A=0, B=1, C=0   (only B)
+    class 3: A=0, B=0, C=1   (only C)
+    class 4: A=1, B=1, C=0   (A and B)
+    class 5: A=1, B=0, C=1   (A and C)
+    class 6: A=0, B=1, C=1   (B and C)
+    class 7: A=1, B=1, C=1   (all three)
+
+  Feature sharing matrix (which classes share which features):
+                A    B    C
+    class 1:    ✓
+    class 2:         ✓
+    class 3:              ✓
+    class 4:    ✓    ✓
+    class 5:    ✓         ✓
+    class 6:         ✓    ✓
+    class 7:    ✓    ✓    ✓
+
+  This is richer: classes 4,5,7 all share feature A, for example.
+
+  Smart pairwise analysis: instead of all 28 pairs, focus on pairs that
+  share exactly 1 feature (4-5 share A, 4-6 share B, 5-6 share C) vs
+  pairs that share 0 features (1-2, 1-3, 2-3).
+
+
+LEVEL 3: Two-layer with degree-4 features (2-layer, n=6 or n=8)
+=================================================================
+
+  Input: x ∈ {0,1}^8
+  Layer-1 features (degree 2):
+    A = x0 AND x1
+    B = x2 AND x3
+    C = x4 AND x5
+    D = x6 AND x7
+
+  Layer-2 features (degree 4, computed from layer-1 outputs):
+    P = A AND B = (x0*x1) * (x2*x3)     needs 2 layers
+    Q = C AND D = (x4*x5) * (x6*x7)
+
+  Classes (partition by P, Q):
+    class 0: P=0, Q=0
+    class 1: P=1, Q=0
+    class 2: P=0, Q=1
+    class 3: P=1, Q=1
+
+  This tests HIERARCHICAL feature sharing:
+    - Layer 1 computes A, B, C, D (degree-2 intermediates)
+    - Layer 2 composes them into P, Q (degree-4)
+    - Classes 1 and 3 share feature P (which itself shares A and B)
+    - Can TN-sim attribute features to the correct layer?
+
+  MIXED-DEGREE VARIANT (preferred — tests degree disentangling):
+    Input: x ∈ {0,1}^6
+    Layer-1 features:
+      A = x0 AND x1           (degree 2)
+      B = x2 AND x3           (degree 2)
+      C = x4 AND x5           (degree 2)
+    Layer-2 feature:
+      P = A AND B              (degree 4)
+
+    Classes (mutually exclusive, prioritize by specificity):
+      class 0: P=1             (degree 4: x0*x1*x2*x3 = 1, regardless of C)
+      class 1: A=1, B=0        (degree 2: only feature A active, P=0 by def)
+      class 2: B=1, A=0        (degree 2: only feature B active)
+      class 3: C=1, A=0, B=0   (degree 2: only feature C, no overlap with P)
+      class 4: otherwise        (degree 0/1: none of the above)
+
+    Degree mix across classes:
+      class 0 = degree 4 (product of two AND gates)
+      class 1,2,3 = degree 2 (single AND gates)
+      class 4 = degree 0/1 (default/background)
+
+    This directly tests: can TN-sim/relative-norms distinguish degree-2
+    classes from degree-4 classes? The degree-4 class should have most
+    of its norm in the 2-layer bilinear part, while degree-2 classes
+    should be captured by the first layer alone.
+
+
+FEATURE DISENTANGLING METHODS
+==============================
+
+Method 1: Per-class rank-1 + relative norms
+  - Optimize rank-1 per class
+  - Compute ρ(rank1_class_i, T_class_j) for all i,j
+  - If class i's rank-1 captures feature A, and class j also uses feature A,
+    then ρ should be high
+
+Method 2: Pairwise TN-sim decomposition
+  - For classes that share a feature: high TN-sim in bilinear subspace
+  - For classes with disjoint features: low TN-sim
+  - The TN-sim matrix should reflect the feature sharing matrix
+
+Method 3: Projection of rank-1 onto other classes
+  - Train rank-1 for class 1 (should learn feature A)
+  - Compute <T_class3 | rank1_class1> / <T_class3 | T_class3>
+  - This gives "how much of class 3's tensor is explained by class 1's
+    rank-1 feature" — should be significant if they share feature A
+
+Method 4: Greedy rank building
+  - Optimize rank-1 for class that uses only 1 feature (e.g., class 1 = only A)
+  - Freeze it, compute residual tensor T_class3 - projection onto rank1
+  - Optimize another rank-1 on the residual → should find feature B
+  - This is like greedy tensor decomposition guided by feature sharing
+
+Method 5 (2-layer): Layer-wise relative norms
+  - Decompose the degree-4 tensor into layer contributions
+  - degree-2 component (from residual path through layer 2) vs
+    degree-4 component (from bilinear composition)
+  - Relative norms tell you "how much is degree-2 vs degree-4"
+
+
+MODEL ARCHITECTURE
+==================
+
+Adapt from ResidualBilinearMNIST:
+  - Input dim: n (4, 6, or 8)
+  - No embedding needed (input already low-dim)
+  - Hidden dim: small but > needed rank (e.g., 16-32)
+  - Rank: > number of features (e.g., 8-16)
+  - Output: K classes (softmax + cross-entropy)
+
+  1-layer: logits = W_head @ (x + D @ ((L@x) ⊙ (R@x)))
+  2-layer: logits = W_head @ (h + D2 @ ((L2@h) ⊙ (R2@h)))
+           where  h = x + D1 @ ((L1@x) ⊙ (R1@x))
+
+Training: all 2^n patterns with their class labels.
+  n=4: 16 patterns (tiny)
+  n=6: 64 patterns
+  n=8: 256 patterns
+Weight decay to encourage sparse/clean solutions.
+
+
+OVERNIGHT EXECUTION PLAN
+=========================
+
+Phase 1: Build infrastructure (~1 hour)
+  - BooleanBilinearModel class
+  - Dataset generation for all levels
+  - Training loop (should converge fast on these tiny datasets)
+  - Adapt TN-sim / relative norm code for small models
+
+Phase 2: Level 1 — pure AND features (~2 hours)
+  - Train, verify 100% accuracy
+  - Relative norms per class
+  - Rank-1 optimization per class
+  - Compare rank-1 vectors to ground truth (e_i, e_j)
+  - Pairwise TN-sim matrix
+  - Method 3: project rank-1 of class 1 onto class 3 (shared feature A)
+  - Visualize everything, save results
+
+Phase 3: Level 2 — three features, 8 classes (~2 hours)
+  - Train, verify accuracy
+  - Full analysis pipeline from Phase 2
+  - Feature sharing matrix recovery: does TN-sim structure match ground truth?
+  - Method 4: greedy rank building on multi-feature classes
+  - Quantify: can we correctly identify which features each class uses?
+
+Phase 4: Level 3 — two-layer, degree-4 (~2-3 hours)
+  - Train 2-layer model on degree-4 task
+  - Layer-wise relative norms (degree-2 vs degree-4)
+  - Can rank-1 per layer recover the intermediate features?
+  - Compare 1-layer vs 2-layer: 1-layer can't solve degree-4,
+    what does TN-sim show when the model is insufficient?
+
+Phase 5: Write up (~30 min)
+  - Summary of all results
+  - Which methods work, which don't
+  - Implications for applying TN-sim to real networks
+
+
+KEY METRICS TO TRACK
+====================
+
+For each level:
+  1. Model accuracy (should be 100% or near it)
+  2. ρ(residual) and ρ(bilinear) per class
+  3. Rank-1 TN-sim per class
+  4. Rank-1 vector alignment with ground truth features
+  5. Pairwise TN-sim matrix vs ground truth feature sharing matrix
+  6. Cross-class projection fractions (Method 3)
+  7. Greedy rank decomposition quality (Method 4)
+
+
+CONNECTIONS TO REAL NETWORKS
+=============================
+
+If this works, the same methods apply to:
+  - MNIST: what are the "features" for each digit?
+  - Language models: what intermediate features does each layer compute?
+  - The key insight: we don't need to know the ground truth in advance.
+    The rank-1 optimization + projection method can discover features
+    and their sharing structure automatically.
+
+The Boolean benchmark just lets us VALIDATE the methods first.

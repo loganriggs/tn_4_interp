@@ -1,0 +1,200 @@
+================================================================================
+BOOLEAN BENCHMARK RESULTS SUMMARY
+================================================================================
+
+OVERVIEW
+========
+Three progressively harder levels testing whether TN-sim-based methods can
+recover known feature-sharing structure from trained bilinear networks.
+
+All experiments use mutually exclusive classes (proper partition of input space).
+Ground truth features are AND gates: AND(x_i, x_j) = x_i * x_j = rank-1 bilinear.
+
+================================================================================
+LEVEL 1: Two AND features, 4 classes (n=4, 16 patterns)
+================================================================================
+
+Features: A = x0∧x1, B = x2∧x3
+Classes:  C0: A=0,B=0 (9)  C1: A=1,B=0 (3)  C2: A=0,B=1 (3)  C3: A=1,B=1 (1)
+
+Model: 1-layer, d_hidden=16, d_rank=8
+Accuracy: 100%
+
+Results:
+  Relative norms (ρ_res / ρ_bil):
+    C0 (∅):   0.33 / 0.67   — default class, uses both
+    C1 (A):   0.18 / 0.82   — dominated by bilinear ✓
+    C2 (B):   0.18 / 0.82   — dominated by bilinear ✓
+    C3 (AB):  0.32 / 0.68   — uses both (needs 2 AND features)
+
+  Rank-1 TN-sim:
+    C0: 0.88, C1: 0.97, C2: 0.97, C3: 0.78
+    Single-feature classes (C1, C2) have highest rank-1 sim ✓
+    Multi-feature class (C3) has lowest rank-1 sim ✓
+
+  Feature sharing (cross-class TN-sim):
+    C1→C3: +0.546 (shared feature A) ✓
+    C2→C3: +0.500 (shared feature B) ✓
+    C1↔C2: -0.42  (disjoint features) ✓
+
+  Rank-1 vector alignment:
+    C1 rank-1 l,r vectors activate on x0,x1 (feature A) ✓
+    C2 rank-1 l,r vectors activate on x2,x3 (feature B) ✓
+
+VERDICT: Complete success. TN-sim correctly identifies features, their sharing
+structure, and the rank-1 vs multi-rank distinction.
+
+
+================================================================================
+LEVEL 2: Three AND features, 8 classes (n=6, 64 patterns)
+================================================================================
+
+Features: A = x0∧x1, B = x2∧x3, C = x4∧x5
+Classes:  Binary encoding of (A,B,C) → 8 classes
+
+Model: 1-layer, d_hidden=24, d_rank=12
+Accuracy: 100%
+
+Results:
+  Relative norms (ρ_bil):
+    C0 (∅):    0.62   — default (needs all three negations)
+    C1 (A):    0.80   — single feature, high bilinear ✓
+    C2 (B):    0.70
+    C4 (C):    0.73
+    C3 (AB):   0.75   — multi-feature
+    C5 (AC):   0.70
+    C6 (BC):   0.72
+    C7 (ABC):  0.60   — all features, most complex
+
+  Rank-1 TN-sim:
+    Single-feature classes: 0.93-0.97 (highest) ✓
+    Multi-feature classes:  0.86-0.92 (lower)   ✓
+    C7 (ABC): 0.82 (lowest, needs rank-3)       ✓
+
+  Feature sharing detection:
+    C1(A) → shared classes:    avg sim = +0.35
+    C1(A) → non-shared classes: avg sim = -0.15
+    Gap: +0.50 ✓
+
+    C2(B) → shared: +0.30, non-shared: -0.18, gap: +0.48 ✓
+    C4(C) → shared: +0.28, non-shared: -0.20, gap: +0.48 ✓
+
+  Correlation with ground truth Jaccard similarity:
+    Full TN-sim:     r = 0.867 ✓✓
+    Bilinear TN-sim: r = 0.85  ✓✓
+
+VERDICT: Strong success. TN-sim matrix correlates well with ground truth
+feature sharing (r=0.87). Clear separation between shared and non-shared
+features. Rank-1 quality correctly distinguishes single vs multi-feature classes.
+
+
+================================================================================
+LEVEL 3: Mixed degrees — degree 2 + degree 4 (n=6, 64 patterns)
+================================================================================
+
+Features:
+  A = x0∧x1 (degree 2), B = x2∧x3 (degree 2), C = x4∧x5 (degree 2)
+  P = A∧B (degree 4)
+
+Classes:
+  C0: P=1          (degree 4, 4 patterns)
+  C1: A=1, B=0     (degree 2, 12 patterns)
+  C2: B=1, A=0     (degree 2, 12 patterns)
+  C3: C=1, A=0, B=0 (degree 2, 9 patterns)
+  C4: otherwise     (default, 27 patterns)
+
+1-Layer Model: d_hidden=24, d_rank=12, accuracy=98.4%
+2-Layer Model: d_hidden=24, d_rank=12, accuracy=98.4%
+
+Results (1-layer):
+  Relative norms (ρ_res / ρ_bil):
+    C0 (P, deg4):   0.343 / 0.657   — highest residual fraction
+    C1 (A, deg2):   0.112 / 0.888   — low residual ✓
+    C2 (B, deg2):   0.149 / 0.851   — low residual ✓
+    C3 (C, deg2):   0.161 / 0.839   — low residual ✓
+    C4 (def, deg0):  0.150 / 0.850
+
+  Key observation: The degree-4 class (C0) has HIGHER residual fraction
+  (0.343) compared to degree-2 classes (~0.10-0.16). This is a detectable
+  signal, though the model still uses primarily bilinear computation.
+
+  Rank-1 TN-sim:
+    C0 (deg4): 0.90 — relatively high even for degree-4
+    C1 (deg2): 0.95
+    C2 (deg2): 0.95
+    C3 (deg2): 0.96
+    C4 (def):  0.93
+
+  1-Layer vs 2-Layer per-class accuracy:
+    Both achieve ~98.4% overall. The 1-layer model can approximate the
+    degree-4 class because with only 64 patterns, it can use the residual
+    stream + bilinear approximation rather than truly computing x0*x1*x2*x3.
+
+VERDICT: Partial success. The degree signal is detectable (higher ρ_res for
+degree-4 class), but the 1-layer model can still handle degree-4 on this
+small dataset. A larger input space (n=8, 256 patterns) would likely create
+a clearer separation between 1-layer and 2-layer performance.
+
+
+================================================================================
+OVERALL CONCLUSIONS
+================================================================================
+
+1. TN-sim WORKS for feature disentangling:
+   - Cross-class TN-sim correctly identifies feature sharing (r=0.87 with
+     ground truth Jaccard similarity)
+   - Rank-1 optimization recovers the correct input variables for single-
+     feature classes
+   - Feature sharing gaps (shared vs non-shared) are large and consistent
+
+2. Rank-1 quality signals:
+   - Single-feature classes → high rank-1 TN-sim (0.93-0.97)
+   - Multi-feature classes → lower rank-1 TN-sim (0.78-0.92)
+   - This correctly indicates how many independent features a class uses
+
+3. Relative norms detect computation type:
+   - Degree-2 classes: 80-90% bilinear (AND gates are bilinear operations)
+   - Degree-4 class: 65% bilinear, 34% residual (higher residual fraction)
+   - Default/background classes: mixed
+
+4. Scaling considerations:
+   - With only 64 patterns, 1-layer models can approximate degree-4 via
+     memorization/linear approximation. Need larger input spaces to truly
+     require deeper models for higher-degree features.
+
+5. Methods validated:
+   - Method 1 (per-class rank-1 + relative norms): ✓ works well
+   - Method 2 (pairwise TN-sim): ✓ correlates with ground truth
+   - Method 3 (cross-class projection): ✓ detects feature sharing
+   - Method 4 (greedy rank building): not yet tested
+   - Method 5 (layer-wise norms for 2-layer): partially tested
+
+6. Implications for real networks:
+   - TN-sim can discover shared features WITHOUT knowing ground truth
+   - The projection method (TN-sim of rank1_i onto T_j) is the most
+     directly useful for feature sharing detection
+   - Relative norms give a clean measure of computation type (residual vs
+     bilinear, or degree-2 vs degree-4 in multi-layer case)
+
+
+================================================================================
+FILES
+================================================================================
+
+Code:
+  model.py              — Model classes, datasets, TN-sim utilities
+  level1_analysis.py    — Level 1 analysis script
+  level2_analysis.py    — Level 2 analysis script
+  level3_analysis.py    — Level 3 analysis script
+  PLAN.txt              — Benchmark design document
+
+Results:
+  level1_results.pt     — Saved model states + analysis results
+  level2_results.pt
+  level3_results.pt
+
+Images:
+  images/level1/        — 3 plots (norms, projections, rank-1 vectors)
+  images/level2/        — 4 plots (norms, sim matrices, rank-1 vs features,
+                           TN-sim vs ground truth correlation)
+  images/level3/        — 2 plots (1-layer analysis, 1L vs 2L comparison)
