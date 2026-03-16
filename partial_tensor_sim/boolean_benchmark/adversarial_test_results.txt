@@ -1,0 +1,92 @@
+ADVERSARIAL TESTS FOR SHARED FEATURE EXTRACTION
+Device: cuda
+Optimization: n_seeds=20, steps=3000, lr=0.01
+
+======================================================================
+TEST 1: Random tensors (no shared structure)
+======================================================================
+  Trial 0: init_sim=+0.0242  final_sim=+0.0000  ||S||/||T_i||=0.0374
+  Trial 1: init_sim=+0.0747  final_sim=+0.0000  ||S||/||T_i||=0.0963
+  Trial 2: init_sim=-0.1994  final_sim=+0.0000  ||S||/||T_i||=0.3493
+  Trial 3: init_sim=-0.0205  final_sim=+0.0000  ||S||/||T_i||=0.0394
+  Trial 4: init_sim=-0.1705  final_sim=+0.0000  ||S||/||T_i||=0.1978
+
+  Average final |sim|: 0.0000
+  Average ||S||/||T_i||: 0.1440
+  Verdict: WARN: Method always finds small S that zeros out sim — suspicious
+
+======================================================================
+TEST 2: Known shared feature + noise
+======================================================================
+  ||feature_A||^2 = 0.5000
+  ||T_i||^2 = 0.5912
+  ||T_j||^2 = 0.4688
+  init_sim(T_i, T_j) = +0.8142
+  final_sim(T_i-S, T_j) = +0.0000
+  TN-sim(S, feature_A) = -0.1383
+  ||S||/||T_i|| = 3.5119
+  S.l = [+0.418, +0.775, -1.059, -0.959, +0.752, +1.132]
+  S.r = [-0.384, -0.716, -1.064, +0.916, -0.774, +0.872]
+  (Ground truth: l=[+1,0,0,0,0,0], r=[0,+1,0,0,0,0])
+  Verdict: FAIL: Did NOT recover the shared feature
+
+======================================================================
+TEST 3: Disjoint features (orthogonal inputs)
+======================================================================
+  init_sim(A, B) = +0.000000 (should be ~0, orthogonal)
+  final_sim(A-S, B) = +0.000000
+  ||S||/||T_A|| = 0.002063
+  ||S||^2 = 0.000002
+  Verdict: PASS: S is near-zero for already-orthogonal tensors
+
+======================================================================
+TEST 4: Partially overlapping features
+======================================================================
+  ||feature_A||^2 = 0.5000
+  ||T_i||^2 = 1.0000  (A+B)
+  ||T_j||^2 = 1.0000  (A+C)
+  init_sim(T_i, T_j) = +0.5000
+  final_sim(T_i-S, T_j) = +0.0000
+  TN-sim(S, feature_A) = +0.1733  (shared — should be high)
+  TN-sim(S, feature_B) = -0.2821  (T_i only — should be low)
+  TN-sim(S, feature_C) = +0.2614  (T_j only — should be low)
+  ||S||/||T_i|| = 1.6265
+  S.l = [-0.553, +0.544, +0.677, +0.721, -0.808, +0.516]
+  S.r = [+0.534, -0.546, -0.700, -0.680, +0.536, -0.764]
+  (Ground truth A: l=[+1,0,0,0,0,0], r=[0,+1,0,0,0,0])
+  Verdict: FAIL: Did NOT extract the shared feature
+
+======================================================================
+TEST 5: Spurious correlation (positive TN-sim, different features)
+======================================================================
+  T_i = x0*x1 (feature A)
+  T_j = x0*x2 (feature D — shares x0 dimension)
+  init_sim(A, D) = +0.0000 (nonzero due to shared x0)
+  final_sim(A-S, D) = +0.0000
+  ||S||/||T_A|| = 0.0284
+  S.l = [+0.049, +0.065, -0.038, -0.285, -0.316, -0.076]
+  S.r = [+0.064, -0.235, +0.049, +0.220, +0.099, +0.171]
+  S.d = +0.1360
+  TN-sim(S, A=x0*x1) = -0.0353
+  TN-sim(S, D=x0*x2) = +0.0000
+
+  --- Sub-test: non-orthogonal random features ---
+  init_sim = -0.0714
+  final_sim = +0.0000
+  ||S||/||T_i|| = 0.0931
+  TN-sim(S, T_i) = +0.3695
+  TN-sim(S, T_j) = -0.7663
+  Verdict: INFO: Method found some shared structure (x0 IS genuinely shared)
+
+======================================================================
+SUMMARY
+======================================================================
+  test1: WARN: Method always finds small S that zeros out sim — suspicious
+  test2: FAIL: Did NOT recover the shared feature
+  test3: PASS: S is near-zero for already-orthogonal tensors
+  test4: FAIL: Did NOT extract the shared feature
+  test5: INFO: Method found some shared structure (x0 IS genuinely shared)
+
+----------------------------------------------------------------------
+  1 PASS, 2 FAIL, 2 other
+  OVERALL: Method has significant issues — may find spurious shared features
